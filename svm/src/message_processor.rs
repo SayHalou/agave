@@ -1,11 +1,25 @@
 use {
     solana_program_runtime::invoke_context::InvokeContext,
+    solana_pubkey::Pubkey,
     solana_svm_measure::measure_us,
     solana_svm_timings::{ExecuteDetailsTimings, ExecuteTimings},
     solana_svm_transaction::svm_message::SVMMessage,
-    solana_transaction_context::IndexOfAccount,
+    solana_transaction_context::{IndexOfAccount, TransactionContext},
     solana_transaction_error::TransactionError,
+    std::{cell::RefCell, sync::Arc},
 };
+
+/// Callback type for instruction-level capture during ledger replay.
+/// Arguments: program_id, instruction_index, transaction_context, is_pre
+pub type InstructionCaptureCallback =
+    Arc<dyn Fn(&Pubkey, usize, &TransactionContext, bool) + Send + Sync>;
+
+thread_local! {
+    /// Set by sbf-capture before replay; cleared after. Only active on the
+    /// replay thread — zero overhead for all other code paths.
+    pub static INSTRUCTION_CAPTURE: RefCell<Option<InstructionCaptureCallback>> =
+        const { RefCell::new(None) };
+}
 
 /// Process a message.
 /// This method calls each instruction in the message over the set of loaded accounts.
@@ -20,6 +34,9 @@ pub(crate) fn process_message<'ix_data>(
     accumulated_consumed_units: &mut u64,
 ) -> Result<(), TransactionError> {
     debug_assert_eq!(program_indices.len(), message.num_instructions());
+
+    let capture = INSTRUCTION_CAPTURE.with(|c| c.borrow().clone());
+
     for (top_level_instruction_index, ((program_id, instruction), program_account_index)) in message
         .program_instructions_iter()
         .zip(program_indices.iter())
@@ -36,6 +53,15 @@ pub(crate) fn process_message<'ix_data>(
                 TransactionError::InstructionError(top_level_instruction_index as u8, err)
             })?;
 
+        if let Some(ref cb) = capture {
+            cb(
+                program_id,
+                top_level_instruction_index,
+                &invoke_context.transaction_context,
+                true,
+            );
+        }
+
         let mut compute_units_consumed = 0;
         let (result, process_instruction_us) = measure_us!({
             if invoke_context.is_precompile(program_id) {
@@ -48,6 +74,17 @@ pub(crate) fn process_message<'ix_data>(
                 invoke_context.process_instruction(&mut compute_units_consumed, execute_timings)
             }
         });
+
+        if result.is_ok() {
+            if let Some(ref cb) = capture {
+                cb(
+                    program_id,
+                    top_level_instruction_index,
+                    &invoke_context.transaction_context,
+                    false,
+                );
+            }
+        }
 
         *accumulated_consumed_units =
             accumulated_consumed_units.saturating_add(compute_units_consumed);

@@ -109,6 +109,7 @@ mod ledger_path;
 mod ledger_utils;
 mod output;
 mod program;
+mod sbf_capture;
 
 fn render_dot(dot: String, output_file: &str, output_format: &str) -> io::Result<()> {
     let mut child = Command::new("dot")
@@ -1694,6 +1695,7 @@ fn main() {
                 )
                 .arg(&allow_dead_slots_arg),
         )
+        .subcommand(sbf_capture::sbf_capture_subcommand())
         .program_subcommand()
         .get_matches();
 
@@ -3245,6 +3247,20 @@ fn main() {
                             eprintln!("{err}");
                         }
                     }
+                }
+                ("sbf-capture", Some(arg_matches)) => {
+                    let blockstore = Arc::new(open_blockstore(
+                        &ledger_path,
+                        arg_matches,
+                        AccessType::Secondary,
+                    ));
+                    let genesis_config = open_genesis_config_by(&ledger_path, arg_matches);
+                    sbf_capture::process_sbf_capture(
+                        arg_matches,
+                        blockstore,
+                        &ledger_path,
+                        &genesis_config,
+                    );
                 }
                 ("", _) => {
                     eprintln!("{}", matches.usage());

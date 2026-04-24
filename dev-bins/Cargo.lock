@@ -120,6 +120,7 @@ dependencies = [
  "agave-snapshots",
  "agave-syscalls",
  "assert_cmd",
+ "base64 0.22.1",
  "bs58",
  "chrono",
  "clap 2.34.0",

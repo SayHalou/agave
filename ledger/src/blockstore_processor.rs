@@ -829,6 +829,9 @@ pub enum BlockstoreProcessorError {
 /// processing the blockstore
 pub type ProcessSlotCallback = Arc<dyn Fn(&Bank) + Sync + Send>;
 
+pub type ProcessInstructionCaptureCallback =
+    Arc<dyn Fn(&solana_pubkey::Pubkey, usize, &solana_transaction_context::TransactionContext, bool) + Send + Sync>;
+
 #[derive(Default, Clone)]
 pub struct ProcessOptions {
     /// Run PoH, transaction signature and other transaction verifications on the entries.
@@ -853,6 +856,8 @@ pub struct ProcessOptions {
     pub hash_overrides: Option<HashOverrides>,
     pub abort_on_invalid_block: bool,
     pub no_block_cost_limits: bool,
+    /// Optional instruction-level capture callback for sbf-capture replay.
+    pub instruction_capture: Option<ProcessInstructionCaptureCallback>,
 }
 
 pub fn test_process_blockstore(
@@ -965,6 +970,21 @@ pub fn process_blockstore_from_root(
 
     info!("Processing ledger from slot {start_slot}...");
     let now = Instant::now();
+
+    // Install instruction-level capture callback for sbf-capture if requested.
+    // The thread_local is read directly by process_message; cleared on return.
+    if let Some(ref cb) = opts.instruction_capture {
+        solana_svm::message_processor::INSTRUCTION_CAPTURE
+            .with(|c| *c.borrow_mut() = Some(cb.clone()));
+    }
+    struct CaptureGuard;
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            solana_svm::message_processor::INSTRUCTION_CAPTURE
+                .with(|c| *c.borrow_mut() = None);
+        }
+    }
+    let _guard = opts.instruction_capture.as_ref().map(|_| CaptureGuard);
 
     // Ensure start_slot is rooted for correct replay; also ensure start_slot and
     // qualifying children are marked as connected
