@@ -1,10 +1,10 @@
 /// sbf-capture: capture instruction-level account snapshots from ledger replay.
 ///
-/// Produces .sbf_state JSON files (one per matching instruction) compatible
-/// with the solana-sbf-ida-processor corpus runner and agave-fuzz-harness.
+/// Produces raw .sbf_capture.json payloads consumed by solana-sbf-ida-processor's
+/// Python capture core. The Python side owns .sbf_state/.sbf_result fidelity.
 use {
-    base64::{engine::general_purpose::STANDARD as B64, Engine as _},
     crate::ledger_utils::load_and_process_ledger_or_exit,
+    base64::{engine::general_purpose::STANDARD as B64, Engine as _},
     clap::{App, Arg, ArgMatches, SubCommand},
     log::*,
     solana_accounts_db::accounts_db::AccountsDbConfig,
@@ -18,7 +18,7 @@ use {
     solana_signature::Signature,
     solana_transaction_context::TransactionContext,
     std::{
-        collections::HashSet,
+        collections::{BTreeMap, HashSet},
         fs,
         io::Write,
         path::PathBuf,
@@ -97,12 +97,14 @@ pub fn process_sbf_capture(
     let only_ix_index: Option<usize> = arg_matches
         .value_of("instruction_index")
         .map(|s| s.parse().expect("--instruction-index must be a number"));
+    let target_signature = arg_matches
+        .value_of("signature")
+        .map(|sig| Signature::from_str(sig).expect("invalid --signature"));
 
     // Resolve target slot.
-    let target_slot = if let Some(sig_str) = arg_matches.value_of("signature") {
-        let sig = Signature::from_str(sig_str).expect("invalid --signature");
+    let target_slot = if let Some(sig) = target_signature.as_ref() {
         blockstore
-            .get_transaction_status(sig, &HashSet::default())
+            .get_transaction_status(sig.clone(), &HashSet::default())
             .expect("blockstore error looking up signature")
             .map(|(slot, _)| slot)
             .unwrap_or_else(|| {
@@ -125,33 +127,45 @@ pub fn process_sbf_capture(
     let captures: Arc<Mutex<Vec<CaptureRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let captures_cb = Arc::clone(&captures);
 
-    let sig_label = arg_matches
-        .value_of("signature")
-        .map(|s| s[..8].to_string())
-        .unwrap_or_else(|| format!("slot{target_slot}"));
-
-    let callback: ProcessInstructionCaptureCallback = Arc::new(
-        move |program_id_arg: &Pubkey,
-              ix_index: usize,
-              tx_context: &TransactionContext,
-              is_pre: bool| {
-            if program_id_arg != &program_id {
+    let callback: ProcessInstructionCaptureCallback = Arc::new(move |event| {
+        let tx_signature = event.signature;
+        let slot = event.slot;
+        let program_id_arg = event.program_id;
+        let ix_index = event.instruction_index;
+        let instruction_data = event.instruction_data;
+        let instruction_accounts = event.instruction_account_indices;
+        let signer_flags = event.signer_flags;
+        let writable_flags = event.writable_flags;
+        let tx_context = event.transaction_context;
+        let is_pre = event.is_pre;
+        if program_id_arg != &program_id {
+            return;
+        }
+        if let Some(expected) = target_signature.as_ref() {
+            if tx_signature != Some(expected) {
                 return;
             }
-            if let Some(only) = only_ix_index {
-                if ix_index != only {
-                    return;
-                }
+        }
+        if let Some(only) = only_ix_index {
+            if ix_index != only {
+                return;
             }
-            let snapshot = snapshot_transaction_context(tx_context, program_id_arg, ix_index);
-            captures_cb.lock().unwrap().push(CaptureRecord {
-                ix_index,
-                is_pre,
-                snapshot,
-                sig_label: sig_label.clone(),
-            });
-        },
-    );
+        }
+        let signature = tx_signature
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("slot{slot}"));
+        let accounts = snapshot_transaction_context(tx_context, signer_flags, writable_flags);
+        captures_cb.lock().unwrap().push(CaptureRecord {
+            ix_index,
+            is_pre,
+            signature,
+            slot,
+            program_id: program_id_arg.to_string(),
+            instruction_data: B64.encode(instruction_data),
+            instruction_account_indices: instruction_accounts.to_vec(),
+            accounts,
+        });
+    });
 
     // Build ProcessOptions: halt at target slot, skip PoH verification for speed.
     let process_options = ProcessOptions {
@@ -173,26 +187,63 @@ pub fn process_sbf_capture(
         None, // transaction_status_sender
     );
 
-    // Write captured snapshots to disk.
+    // Write paired capture payloads to disk.  The Python capture core converts
+    // this raw boundary format into .sbf_state / .sbf_result and applies the
+    // fidelity gates.  Do not emit .sbf_state directly from this Rust side while
+    // program ELF/sysvars/compute-unit fields are incomplete.
     let records = captures.lock().unwrap();
     if records.is_empty() {
         warn!("sbf-capture: no instructions matched program {program_id} in slot {target_slot}");
         return;
     }
 
+    let mut pairs: BTreeMap<(String, usize), CapturePair> = BTreeMap::new();
     for record in records.iter() {
-        let phase = if record.is_pre { "pre" } else { "post" };
-        let filename = format!("{}_ix{}_{}.sbf_state", record.sig_label, record.ix_index, phase);
+        let pair = pairs
+            .entry((record.signature.clone(), record.ix_index))
+            .or_insert_with(|| CapturePair::from_record(record));
+        if record.is_pre {
+            pair.pre_accounts = Some(record.accounts.clone());
+        } else {
+            pair.post_accounts = Some(record.accounts.clone());
+        }
+    }
+
+    for ((signature, ix_index), pair) in pairs.iter() {
+        let short_sig = short_signature(signature);
+        let filename = format!(
+            "slot{}_{}_ix{}.sbf_capture.json",
+            pair.slot, short_sig, ix_index
+        );
         let path = output_dir.join(&filename);
-        let json = serde_json::to_string_pretty(&record.snapshot)
-            .expect("failed to serialize sbf_state");
+        let capture = serde_json::json!({
+            "signature": signature,
+            "slot": pair.slot,
+            "instruction_index": ix_index,
+            "invoke_depth": 1,
+            "program_id": pair.program_id,
+            "instruction_data": pair.instruction_data,
+            "pre_accounts": pair.pre_accounts.clone().unwrap_or_default(),
+            "post_accounts": pair.post_accounts.clone().unwrap_or_default(),
+            "status": if pair.post_accounts.is_some() { "Ok" } else { "unknown" },
+            "metadata": {
+                "capture_format": "sbf_capture_json_v1",
+                "capture_mode": "instrumented_ledger_replay",
+                "pre_state_kind": "pre_instruction_exact",
+                "agave_commit": "765ee54adc",
+                "instruction_account_indices": pair.instruction_account_indices,
+            }
+        });
+        let json = serde_json::to_string_pretty(&capture).expect("failed to serialize sbf capture");
         let mut f = fs::File::create(&path).expect("failed to create output file");
-        f.write_all(json.as_bytes()).expect("failed to write output file");
+        f.write_all(json.as_bytes())
+            .expect("failed to write output file");
         info!("sbf-capture: wrote {}", path.display());
     }
 
     println!(
-        "sbf-capture: captured {} snapshots → {}",
+        "sbf-capture: captured {} instruction payload(s) from {} snapshot(s) → {}",
+        pairs.len(),
         records.len(),
         output_dir.display()
     );
@@ -205,21 +256,52 @@ pub fn process_sbf_capture(
 struct CaptureRecord {
     ix_index: usize,
     is_pre: bool,
-    sig_label: String,
-    snapshot: serde_json::Value,
+    signature: String,
+    slot: u64,
+    program_id: String,
+    instruction_data: String,
+    instruction_account_indices: Vec<u8>,
+    accounts: Vec<serde_json::Value>,
 }
 
-/// Serialize the relevant accounts from TransactionContext into a .sbf_state
-/// JSON value compatible with sbf_state/schema.py v3.
+struct CapturePair {
+    slot: u64,
+    program_id: String,
+    instruction_data: String,
+    instruction_account_indices: Vec<u8>,
+    pre_accounts: Option<Vec<serde_json::Value>>,
+    post_accounts: Option<Vec<serde_json::Value>>,
+}
+
+impl CapturePair {
+    fn from_record(record: &CaptureRecord) -> Self {
+        Self {
+            slot: record.slot,
+            program_id: record.program_id.clone(),
+            instruction_data: record.instruction_data.clone(),
+            instruction_account_indices: record.instruction_account_indices.clone(),
+            pre_accounts: None,
+            post_accounts: None,
+        }
+    }
+}
+
+fn short_signature(signature: &str) -> String {
+    signature.chars().take(16).collect()
+}
+
+/// Serialize TransactionContext accounts into the raw capture payload consumed
+/// by solana-sbf-ida-processor's Python capture core.
 fn snapshot_transaction_context(
     tx_context: &TransactionContext,
-    program_id: &Pubkey,
-    ix_index: usize,
-) -> serde_json::Value {
+    signer_flags: &[bool],
+    writable_flags: &[bool],
+) -> Vec<serde_json::Value> {
     let n = tx_context.get_number_of_accounts();
     let mut accounts = Vec::new();
 
     for i in 0..n {
+        let account_index = usize::from(i);
         let key = match tx_context.get_key_of_account_at_index(i) {
             Ok(k) => *k,
             Err(_) => continue,
@@ -238,8 +320,8 @@ fn snapshot_transaction_context(
             "pubkey": key.to_string(),
             "pubkey_bytes": pubkey_bytes,
             "index": i,
-            "is_signer": false,
-            "is_writable": true,
+            "is_signer": signer_flags.get(account_index).copied().unwrap_or(false),
+            "is_writable": writable_flags.get(account_index).copied().unwrap_or(false),
             "lamports": acct.lamports(),
             "data": data_b64,
             "owner": acct.owner().to_string(),
@@ -253,44 +335,5 @@ fn snapshot_transaction_context(
         }));
     }
 
-    serde_json::json!({
-        "version": 3,
-        "program_id": program_id.to_string(),
-        "program_id_bytes": B64.encode(program_id.as_ref()),
-        "program_elf_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-        "sbf_version": 0,
-        "abi_version": 1,
-        "transaction": {
-            "signature": "capture",
-            "slot": 0,
-            "instruction_data": "",
-            "compute_budget_limit": 200000,
-            "compute_units_consumed_before": 0,
-            "fidelity": {
-                "compute_budget_limit": "exact",
-                "compute_units_consumed_before": "exact"
-            }
-        },
-        "accounts": accounts,
-        "sysvars": {},
-        "cpi_snapshots": [],
-        "fidelity": {
-            "overall": "exact",
-            "accounts": "exact",
-            "sysvars": "inferred",
-            "cpi": "absent",
-            "program_elf": "unknown"
-        },
-        "engine_compatibility": {
-            "debug_replay": true,
-            "svm_semantic": true,
-            "debug_replay_notes": "",
-            "svm_semantic_notes": ""
-        },
-        "metadata": {
-            "capture_source": "ledger_replay",
-            "agave_commit": "765ee54adc",
-            "instruction_index": ix_index
-        }
-    })
+    accounts
 }

@@ -830,7 +830,7 @@ pub enum BlockstoreProcessorError {
 pub type ProcessSlotCallback = Arc<dyn Fn(&Bank) + Sync + Send>;
 
 pub type ProcessInstructionCaptureCallback =
-    Arc<dyn Fn(&solana_pubkey::Pubkey, usize, &solana_transaction_context::TransactionContext, bool) + Send + Sync>;
+    solana_svm::message_processor::InstructionCaptureCallback;
 
 #[derive(Default, Clone)]
 pub struct ProcessOptions {
@@ -980,8 +980,7 @@ pub fn process_blockstore_from_root(
     struct CaptureGuard;
     impl Drop for CaptureGuard {
         fn drop(&mut self) {
-            solana_svm::message_processor::INSTRUCTION_CAPTURE
-                .with(|c| *c.borrow_mut() = None);
+            solana_svm::message_processor::INSTRUCTION_CAPTURE.with(|c| *c.borrow_mut() = None);
         }
     }
     let _guard = opts.instruction_capture.as_ref().map(|_| CaptureGuard);

@@ -6,7 +6,7 @@ use {
             TransactionLoadResult, ValidatedTransactionDetails,
         },
         account_overrides::AccountOverrides,
-        message_processor::process_message,
+        message_processor::{process_message, set_instruction_capture_transaction},
         nonce_info::NonceInfo,
         program_loader::{get_program_modification_slot, load_program_with_pubkey},
         rollback_accounts::RollbackAccounts,
@@ -917,6 +917,8 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         );
 
         let mut process_message_time = Measure::start("process_message_time");
+        let _instruction_capture_transaction_guard =
+            set_instruction_capture_transaction(tx.signature().clone(), self.slot);
         let process_result = process_message(
             tx,
             &loaded_transaction.program_indices,

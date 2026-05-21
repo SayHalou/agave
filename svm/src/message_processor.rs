@@ -1,6 +1,8 @@
 use {
+    solana_clock::Slot,
     solana_program_runtime::invoke_context::InvokeContext,
     solana_pubkey::Pubkey,
+    solana_signature::Signature,
     solana_svm_measure::measure_us,
     solana_svm_timings::{ExecuteDetailsTimings, ExecuteTimings},
     solana_svm_transaction::svm_message::SVMMessage,
@@ -9,16 +11,89 @@ use {
     std::{cell::RefCell, sync::Arc},
 };
 
-/// Callback type for instruction-level capture during ledger replay.
-/// Arguments: program_id, instruction_index, transaction_context, is_pre
+/// Instruction-level capture event emitted during ledger replay.
+pub struct InstructionCaptureEvent<'a, 'ix_data> {
+    pub signature: Option<&'a Signature>,
+    pub slot: Slot,
+    pub program_id: &'a Pubkey,
+    pub instruction_index: usize,
+    pub instruction_data: &'a [u8],
+    pub instruction_account_indices: &'a [u8],
+    pub signer_flags: &'a [bool],
+    pub writable_flags: &'a [bool],
+    pub transaction_context: &'a TransactionContext<'ix_data>,
+    pub is_pre: bool,
+}
+
 pub type InstructionCaptureCallback =
-    Arc<dyn Fn(&Pubkey, usize, &TransactionContext, bool) + Send + Sync>;
+    Arc<dyn for<'a, 'ix_data> Fn(InstructionCaptureEvent<'a, 'ix_data>) + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) struct InstructionCaptureTransaction {
+    pub signature: Signature,
+    pub slot: Slot,
+}
+
+pub(crate) struct InstructionCaptureTransactionGuard;
+
+impl Drop for InstructionCaptureTransactionGuard {
+    fn drop(&mut self) {
+        INSTRUCTION_CAPTURE_TRANSACTION.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+pub(crate) fn set_instruction_capture_transaction(
+    signature: Signature,
+    slot: Slot,
+) -> InstructionCaptureTransactionGuard {
+    INSTRUCTION_CAPTURE_TRANSACTION.with(|c| {
+        *c.borrow_mut() = Some(InstructionCaptureTransaction { signature, slot });
+    });
+    InstructionCaptureTransactionGuard
+}
 
 thread_local! {
     /// Set by sbf-capture before replay; cleared after. Only active on the
     /// replay thread — zero overhead for all other code paths.
     pub static INSTRUCTION_CAPTURE: RefCell<Option<InstructionCaptureCallback>> =
         const { RefCell::new(None) };
+    pub(crate) static INSTRUCTION_CAPTURE_TRANSACTION:
+        RefCell<Option<InstructionCaptureTransaction>> = const { RefCell::new(None) };
+}
+
+fn emit_instruction_capture<'ix_data>(
+    capture: &Option<InstructionCaptureCallback>,
+    message: &impl SVMMessage,
+    program_id: &Pubkey,
+    instruction_index: usize,
+    instruction_data: &[u8],
+    instruction_accounts: &[u8],
+    transaction_context: &TransactionContext<'ix_data>,
+    is_pre: bool,
+) {
+    let Some(capture) = capture else {
+        return;
+    };
+    let account_count = usize::from(transaction_context.get_number_of_accounts());
+    let signer_flags = (0..account_count)
+        .map(|index| message.is_signer(index))
+        .collect::<Vec<_>>();
+    let writable_flags = (0..account_count)
+        .map(|index| message.is_writable(index))
+        .collect::<Vec<_>>();
+    let tx_context = INSTRUCTION_CAPTURE_TRANSACTION.with(|c| c.borrow().clone());
+    capture(InstructionCaptureEvent {
+        signature: tx_context.as_ref().map(|ctx| &ctx.signature),
+        slot: tx_context.as_ref().map(|ctx| ctx.slot).unwrap_or_default(),
+        program_id,
+        instruction_index,
+        instruction_data,
+        instruction_account_indices: instruction_accounts,
+        signer_flags: &signer_flags,
+        writable_flags: &writable_flags,
+        transaction_context,
+        is_pre,
+    });
 }
 
 /// Process a message.
@@ -53,14 +128,16 @@ pub(crate) fn process_message<'ix_data>(
                 TransactionError::InstructionError(top_level_instruction_index as u8, err)
             })?;
 
-        if let Some(ref cb) = capture {
-            cb(
-                program_id,
-                top_level_instruction_index,
-                &invoke_context.transaction_context,
-                true,
-            );
-        }
+        emit_instruction_capture(
+            &capture,
+            message,
+            program_id,
+            top_level_instruction_index,
+            instruction.data,
+            instruction.accounts,
+            &invoke_context.transaction_context,
+            true,
+        );
 
         let mut compute_units_consumed = 0;
         let (result, process_instruction_us) = measure_us!({
@@ -76,14 +153,16 @@ pub(crate) fn process_message<'ix_data>(
         });
 
         if result.is_ok() {
-            if let Some(ref cb) = capture {
-                cb(
-                    program_id,
-                    top_level_instruction_index,
-                    &invoke_context.transaction_context,
-                    false,
-                );
-            }
+            emit_instruction_capture(
+                &capture,
+                message,
+                program_id,
+                top_level_instruction_index,
+                instruction.data,
+                instruction.accounts,
+                &invoke_context.transaction_context,
+                false,
+            );
         }
 
         *accumulated_consumed_units =
