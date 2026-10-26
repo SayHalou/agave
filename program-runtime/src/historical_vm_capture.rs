@@ -89,6 +89,8 @@ pub struct VmCaptureStart {
     r2_initial: u64,
     r10_initial: u64,
     regions: Vec<Value>,
+    heap_mapped_bytes: usize,
+    stack_mapped_bytes: usize,
     serialized_before: Vec<u8>,
 }
 
@@ -117,6 +119,18 @@ pub fn begin_vm<C: ContextObject>(
         return None;
     }
     let (text_vaddr, text) = executable.get_text_bytes();
+    // The memory pool can own a larger buffer than the guest VM actually
+    // maps. Capture only the real MemoryRegion backing, never pool tails.
+    let heap_mapped_bytes = mapping
+        .get_regions()
+        .iter()
+        .find(|region| region.vm_addr_range().start >> 32 == 3)?
+        .len();
+    let stack_mapped_bytes = mapping
+        .get_regions()
+        .iter()
+        .find(|region| region.vm_addr_range().start >> 32 == 2)?
+        .len();
     let regions = mapping
         .get_regions()
         .iter()
@@ -156,6 +170,8 @@ pub fn begin_vm<C: ContextObject>(
         r2_initial: r2,
         r10_initial: r10,
         regions,
+        heap_mapped_bytes,
+        stack_mapped_bytes,
         serialized_before: serialized_before.to_vec(),
     })
 }
@@ -172,6 +188,12 @@ pub fn finish_vm(
     execution_mode: &str,
     compute_units: u64,
 ) -> io::Result<PathBuf> {
+    let heap_after = heap_after
+        .get(..capture.heap_mapped_bytes)
+        .ok_or_else(|| io::Error::other("heap pool shorter than mapped VM heap"))?;
+    let stack_after = stack_after
+        .get(..capture.stack_mapped_bytes)
+        .ok_or_else(|| io::Error::other("stack pool shorter than mapped VM stack"))?;
     if register_trace.len() > MAX_REGISTER_STEPS
         || serialized_after.len() != capture.serialized_before.len()
         || heap_after.len() > MAX_HEAP_BYTES

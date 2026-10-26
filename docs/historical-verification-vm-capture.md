@@ -19,7 +19,7 @@ instruction returns. It has explicit provenance limits:
 | Executing SBF text digest | SHA-256 of `Executable::get_text_bytes()`; distinct from original ELF identity |
 | Actual VM memory regions | `MemoryMapping::get_regions()`, exact `len`, `vm_addr_range`, `gap_size`, backing mutability |
 | Exact invocation input | `serialize_parameters` output bytes before and after execution |
-| Runtime stack/heap bytes | Captured **before** VM buffers return to the pool |
+| Runtime stack/heap bytes | Captured **only** the actual VM-mapped backing bytes, before pool reuse |
 | Actual original instruction trace | Interpreter `register_trace` before instruction; original 12 registers plus PC |
 | Real Ledger/Bank verification | **UNVERIFIED**: SVM test callback alone is not a historical ledger |
 | Bank post-commit account image | **UNVERIFIED**: instruction buffers are not committed Bank state |
@@ -105,7 +105,11 @@ The receipt stores the SHA-256 and byte length of the original serialized
 input, its postimage, heap, stack, and exact serialized full register
 trace. Every VM region includes the actual virtual start/extent,
 backing byte length, read/write status and exact gap size; addresses
-inside stack gaps are not proven valid. `r1/r2/r10`,
+inside stack gaps are not proven valid. The pooled host Heap may be
+larger than the guest Heap mapping. Its unmapped tail must **never**
+appear in the capture or enter Pointer/Length/Bounds reasoning; the
+integration test checks each saved binary length against the actual
+`MemoryMapping::get_regions()` backing length. `r1/r2/r10`,
 `instruction_data_offset`, direct account mapping mode,
 instruction trace index/CPI depth, original ELF hash, executable text
 hash, Program ID, deployment slot, transaction signature and slot are

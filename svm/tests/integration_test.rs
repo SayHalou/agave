@@ -4053,9 +4053,12 @@ fn historical_vm_capture_same_transaction() {
         assert_eq!(steps[0]["registers"][1], receipt["r1_initial"]);
         assert_eq!(steps[0]["registers"][10], receipt["r10_initial"]);
         let regions = receipt["vm_regions"].as_array().unwrap();
-        assert!(regions.iter().any(|r| r["label"] == "stack" && r["backing_length"].as_u64().unwrap() > 0));
-        assert!(regions.iter().any(|r| r["label"] == "heap" && r["backing_length"].as_u64().unwrap() > 0));
-        assert!(regions.iter().any(|r| r["label"] == "input" && r["backing_length"].as_u64().unwrap() > 0));
+        assert!(regions.iter().any(|r| r["label"] == "stack"
+            && r["backing_length"].as_u64().unwrap() == stack.len() as u64));
+        assert!(regions.iter().any(|r| r["label"] == "heap"
+            && r["backing_length"].as_u64().unwrap() == heap.len() as u64));
+        assert!(regions.iter().any(|r| r["label"] == "input"
+            && r["backing_length"].as_u64().unwrap() == raw_input.len() as u64));
         // Caller-supplied snapshot is not a verified Ledger/Bank. Root and
         // Bounds must remain unknown even when a real VM execution succeeds.
         assert_eq!(receipt["historical_ledger_verified"], false);
