@@ -3450,10 +3450,18 @@ pub mod tests {
         let invalid_transfer_amount = mint + 1;
         let mut entries = vec![];
         let blockhash = genesis_config.hash();
+        let mut historical_ordered_signatures = Vec::new();
+        let mut first_instruction_sha = None;
         for _ in 0..deducted_from_mint {
             // Transfer one token from the mint to a random account
             let keypair = Keypair::new();
             let tx = system_transaction::transfer(&mint_keypair, &keypair.pubkey(), 1, blockhash);
+            if first_instruction_sha.is_none() {
+                first_instruction_sha = Some(crate::historical_vm_ledger_provenance::sha256_hex(
+                    &tx.message.instructions[0].data,
+                ));
+            }
+            historical_ordered_signatures.push(tx.signatures[0]);
             let entry = next_entry_mut(&mut last_entry_hash, 1, vec![tx]);
             entries.push(entry);
 
@@ -3466,6 +3474,7 @@ pub mod tests {
                 invalid_transfer_amount,
                 blockhash,
             );
+            historical_ordered_signatures.push(tx.signatures[0]);
             let entry = next_entry_mut(&mut last_entry_hash, 1, vec![tx]);
             entries.push(entry);
         }
@@ -3516,6 +3525,458 @@ pub mod tests {
         );
         assert_eq!(bank.tick_height(), 2 * genesis_config.ticks_per_slot);
         assert_eq!(bank.last_blockhash(), last_blockhash);
+
+        // A1.7: join REAL Blockstore ledger entries and the replayed Bank.
+        // Synthetic metadata is NOT accepted as independent Ledger source:
+        // status is read directly from this Bank's replay status cache.
+        blockstore.set_roots([0_u64, 1_u64].iter()).unwrap();
+        assert_eq!(
+            blockstore.get_bank_hash(1),
+            Some(bank.hash()),
+            "Replay must persist the Bank hash; do not synthesize a root receipt"
+        );
+        for (index, signature) in historical_ordered_signatures.iter().enumerate() {
+            let status = bank
+                .get_signature_status(signature)
+                .expect("replayed transaction must have recorded Bank status");
+            blockstore
+                .write_transaction_status(
+                    1,
+                    *signature,
+                    std::iter::empty(),
+                    solana_transaction_status::TransactionStatusMeta {
+                        status,
+                        ..Default::default()
+                    },
+                    index,
+                )
+                .unwrap();
+        }
+        let first_signature = historical_ordered_signatures[0];
+        let first_status = bank.get_signature_status(&first_signature).unwrap();
+        let anchored =
+            crate::historical_vm_ledger_provenance::check_rooted_ledger_bank_transaction(
+                &blockstore,
+                &bank,
+                1,
+                0,
+                0,
+                &first_signature,
+                &solana_sdk_ids::system_program::id(),
+                first_instruction_sha.as_ref().unwrap(),
+                &first_status,
+            )
+            .unwrap();
+        assert!(anchored.rooted_blockstore_and_frozen_bank_match);
+        assert_eq!(anchored.signature, first_signature.to_string());
+        assert_eq!(anchored.transaction_index, 0);
+        assert_eq!(anchored.parent_slot, 0);
+        assert!(!anchored.independent_source_authentication);
+        assert!(!anchored.historical_vm_invocation_authenticated);
+        assert!(
+            crate::historical_vm_ledger_provenance::check_rooted_ledger_bank_transaction(
+                &blockstore,
+                &bank,
+                1,
+                1,
+                0,
+                &first_signature,
+                &solana_sdk_ids::system_program::id(),
+                first_instruction_sha.as_ref().unwrap(),
+                &first_status,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::historical_vm_ledger_provenance::check_rooted_ledger_bank_transaction(
+                &blockstore,
+                &bank,
+                1,
+                0,
+                0,
+                &first_signature,
+                &Pubkey::new_unique(),
+                first_instruction_sha.as_ref().unwrap(),
+                &first_status,
+            )
+            .is_err()
+        );
+    }
+
+    /// Events from the *actual* Agave scheduler execution of the rooted
+    /// local Ledger, not after-the-fact synthetic status labels.
+    #[cfg(feature = "historical-vm-capture")]
+    struct A17LedgerReplayObserver {
+        signature: solana_signature::Signature,
+        vault: Pubkey,
+        events: Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "historical-vm-capture")]
+    impl solana_runtime::transaction_execution::HistoricalExecutionObserver
+        for A17LedgerReplayObserver
+    {
+        fn pre_commit(
+            &self,
+            slot: u64,
+            results: &[solana_svm::transaction_processing_result::TransactionProcessingResult],
+        ) -> solana_transaction_error::TransactionResult<()> {
+            if slot != 1 || results.len() != 1
+                || solana_runtime::transaction_execution::classify_processing_result(&results[0])
+                    != solana_runtime::transaction_execution::HistoricalExecutionKind::ExecutedSuccess
+            {
+                return Err(TransactionError::InvalidAccountIndex);
+            }
+            self.events
+                .lock()
+                .unwrap()
+                .push("precommit_executed_success".into());
+            Ok(())
+        }
+
+        fn post_commit(
+            &self,
+            slot: u64,
+            results: &[solana_svm::transaction_commit_result::TransactionCommitResult],
+        ) {
+            let valid = slot == 1
+                && results.len() == 1
+                && results[0]
+                    .as_ref()
+                    .is_ok_and(|entry| entry.status == Ok(()));
+            self.events.lock().unwrap().push(
+                if valid {
+                    "postcommit_success"
+                } else {
+                    "postcommit_invalid"
+                }
+                .into(),
+            );
+        }
+
+        fn post_commit_bank_state(
+            &self,
+            bank: &solana_runtime::bank::Bank,
+            transactions: &[solana_transaction::sanitized::SanitizedTransaction],
+            results: &[solana_svm::transaction_commit_result::TransactionCommitResult],
+        ) {
+            use solana_account::ReadableAccount as _;
+            let valid = bank.slot() == 1
+                && transactions.len() == 1
+                && results.len() == 1
+                && transactions[0].signature() == &self.signature
+                && bank
+                    .get_account(&self.vault)
+                    .is_some_and(|account| account.data().len() == 49 && account.lamports() > 0);
+            self.events.lock().unwrap().push(
+                if valid {
+                    "postcommit_bank_pda49"
+                } else {
+                    "postcommit_bank_invalid"
+                }
+                .into(),
+            );
+        }
+    }
+
+    /// A1.7 exact Anchor ELF executes from a *written* local Ledger, not an
+    /// SVM MockBank callback. The ledger is generated in this test and must
+    /// never be confused with an externally authenticated historical fork.
+    #[cfg(feature = "historical-vm-capture")]
+    #[test]
+    #[ignore = "requires AGAVE_A17_ORIGINAL_ELF and clean capture directory"]
+    fn test_replay_original_anchor_from_real_blockstore_and_bank() {
+        use solana_account::{ReadableAccount as _, state_traits::StateMutWincode as _};
+        use solana_loader_v3_interface::state::UpgradeableLoaderState;
+        use solana_sdk_ids::bpf_loader_upgradeable;
+
+        let elf_path = std::env::var_os("AGAVE_A17_ORIGINAL_ELF")
+            .expect("explicit frozen original Anchor ELF is required");
+        let evidence_dir = std::path::PathBuf::from(
+            std::env::var_os("AGAVE_HISTORICAL_VM_CAPTURE_DIR")
+                .expect("explicit clean VM evidence directory is required"),
+        );
+        assert!(
+            !evidence_dir.exists(),
+            "each run must use a fresh capture root, never stale receipts"
+        );
+        let elf = std::fs::read(elf_path).expect("read exact original ELF");
+        let elf_hash = crate::historical_vm_ledger_provenance::sha256_hex(&elf);
+        assert_eq!(
+            elf_hash,
+            "9503a43e8ca143c6a89370739ef677a9707dfe86dd5976781da18b6c3253d3e5",
+        );
+        let program_id: Pubkey = "6vLKHpfrexFX4fdQTVnGRLSVDuUtxc5zh9oRkWtLcRRS"
+            .parse()
+            .unwrap();
+        let programdata_address = solana_loader_v3_interface::get_program_data_address(&program_id);
+        let loader_id = bpf_loader_upgradeable::id();
+
+        let leader = Pubkey::new_unique();
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_tower_leader(2_000_000_000, &leader, 50);
+        genesis_config.poh_config.hashes_per_tick = Some(12);
+        // The standard genesis test helper sets Rent::free(). Anchor init
+        // would then create a zero-lamport PDA which Bank correctly prunes
+        // after execution, despite the VM returning Ok(0). Use real rent
+        // economics so PostCommit actually retains the new account.
+        genesis_config.rent = solana_rent::Rent::default();
+        let program_state = UpgradeableLoaderState::Program {
+            programdata_address,
+        };
+        let mut program =
+            AccountSharedData::new_data(10_000_000, &program_state, &loader_id).unwrap();
+        program.set_executable(true);
+        genesis_config.add_account(program_id, program);
+        let metadata_size = UpgradeableLoaderState::size_of_programdata_metadata();
+        let size = metadata_size + elf.len();
+        let data_state = UpgradeableLoaderState::ProgramData {
+            slot: 0,
+            upgrade_authority_address: None,
+        };
+        let mut programdata =
+            AccountSharedData::new_data_with_space(100_000_000, &data_state, size, &loader_id)
+                .unwrap();
+        programdata.data_as_mut_slice()[metadata_size..].copy_from_slice(&elf);
+        genesis_config.add_account(programdata_address, programdata);
+
+        let payer = mint_keypair.pubkey();
+        let (vault, _) = Pubkey::find_program_address(&[b"vault", payer.as_ref()], &program_id);
+        let data = [
+            0xaf, 0xaf, 0x6d, 0x1f, 0x0d, 0x98, 0x9b, 0xed, 7, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                solana_instruction::AccountMeta::new(vault, false),
+                solana_instruction::AccountMeta::new(payer, true),
+                solana_instruction::AccountMeta::new_readonly(
+                    solana_sdk_ids::system_program::id(),
+                    false,
+                ),
+            ],
+            data: data.to_vec(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer),
+            &[&mint_keypair],
+            genesis_config.hash(),
+        );
+        let signature = tx.signatures[0];
+        let instruction_sha = crate::historical_vm_ledger_provenance::sha256_hex(&data);
+
+        let (ledger_path, mut last_hash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
+        let mut entries = vec![next_entry_mut(&mut last_hash, 1, vec![tx])];
+        entries.push(next_entry_mut(&mut last_hash, 11, vec![]));
+        let last_hash = entries.last().unwrap().hash;
+        entries.extend(create_ticks(
+            genesis_config.ticks_per_slot - 1,
+            12,
+            last_hash,
+        ));
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        blockstore
+            .write_entries(
+                1,
+                0,
+                0,
+                genesis_config.ticks_per_slot,
+                None,
+                true,
+                &Arc::new(Keypair::new()),
+                entries,
+                0,
+            )
+            .unwrap();
+
+        let opts = ProcessOptions {
+            run_verification: true,
+            ..ProcessOptions::default()
+        };
+        let observer = Arc::new(A17LedgerReplayObserver {
+            signature,
+            vault,
+            events: Mutex::new(Vec::new()),
+        });
+        let exit = Arc::default();
+        let (forks, _) = crate::bank_forks_utils::load_bank_forks_from_genesis(
+            &genesis_config,
+            &blockstore,
+            Vec::new(),
+            &opts,
+            None,
+            None,
+            None,
+            exit,
+        )
+        .unwrap();
+        let mut scheduler_pool =
+            DefaultSchedulerPool::new_for_verification(None, None, None, None, None);
+        DefaultSchedulerPool::set_historical_observer(&mut scheduler_pool, observer.clone())
+            .expect("attach actual Scheduler PreCommit/PostCommit observer");
+        forks
+            .write()
+            .unwrap()
+            .install_scheduler_pool(scheduler_pool);
+        let cache = LeaderScheduleCache::new_from_bank(&forks.read().unwrap().root_bank());
+        process_blockstore_from_root(
+            &blockstore,
+            &forks,
+            compute_shred_version(&genesis_config.hash(), None),
+            &cache,
+            &opts,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let forks = forks.read().unwrap();
+        assert!(frozen_bank_slots(&forks).contains(&1));
+        let bank = forks[1].clone();
+        assert!(bank.is_frozen());
+        let result = bank
+            .get_signature_status(&signature)
+            .expect("real Ledger Anchor signature must be replayed into Bank");
+        assert_eq!(
+            result,
+            Ok(()),
+            "original Anchor Handler and CPI must succeed"
+        );
+        eprintln!(
+            "A17_LEDGER_REPLAY bank_slot={} bank_hash={} vault_balance={} vault_present={} program_present={} payer_balance={} rooted={} bank_frozen={}",
+            bank.slot(),
+            bank.hash(),
+            bank.get_balance(&vault),
+            bank.get_account(&vault).is_some(),
+            bank.get_account(&program_id).is_some(),
+            bank.get_balance(&payer),
+            forks.root(),
+            bank.is_frozen()
+        );
+        let observed_phases = observer.events.lock().unwrap().clone();
+        assert_eq!(
+            observed_phases,
+            vec![
+                "precommit_executed_success",
+                "postcommit_success",
+                "postcommit_bank_pda49",
+            ],
+            "actual Scheduler PreCommit/PostCommit/Bank ordering must agree"
+        );
+        let vault_account = bank.get_account(&vault).unwrap();
+        assert_eq!(vault_account.owner(), &program_id);
+        assert_eq!(vault_account.data().len(), 49);
+        assert_eq!(&vault_account.data()[40..48], &7u64.to_le_bytes());
+
+        // Root and Bank hash are taken from the *actual* verified test
+        // replay, not a fabricated output record.
+        blockstore.set_roots([0_u64, 1_u64].iter()).unwrap();
+        assert_eq!(
+            blockstore.get_bank_hash(1),
+            Some(bank.hash()),
+            "Native Blockstore replay must have persisted exact Bank hash"
+        );
+        blockstore
+            .write_transaction_status(
+                1,
+                signature,
+                std::iter::empty(),
+                solana_transaction_status::TransactionStatusMeta {
+                    status: result.clone(),
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap();
+        let rooted = crate::historical_vm_ledger_provenance::check_rooted_ledger_bank_transaction(
+            &blockstore,
+            &bank,
+            1,
+            0,
+            0,
+            &signature,
+            &program_id,
+            &instruction_sha,
+            &result,
+        )
+        .unwrap();
+        let programdata =
+            crate::historical_vm_ledger_provenance::inspect_frozen_programdata_postimage(
+                &bank,
+                &program_id,
+            )
+            .unwrap();
+        assert_eq!(programdata.deployment_slot, 0);
+        assert_eq!(programdata.raw_programdata_elf_sha256, elf_hash);
+        assert!(!programdata.proves_execution_time_program_version);
+        assert!(!rooted.independent_source_authentication);
+        let check_wrong = |slot, ix_index, program, data_sha, result_ref| {
+            crate::historical_vm_ledger_provenance::check_rooted_ledger_bank_transaction(
+                &blockstore,
+                &bank,
+                slot,
+                0,
+                ix_index,
+                &signature,
+                program,
+                data_sha,
+                result_ref,
+            )
+        };
+        assert!(check_wrong(2, 0, &program_id, &instruction_sha, &result).is_err());
+        assert!(check_wrong(1, 1, &program_id, &instruction_sha, &result).is_err());
+        let wrong_program_id = Pubkey::new_unique();
+        assert!(check_wrong(1, 0, &wrong_program_id, &instruction_sha, &result).is_err());
+        assert!(check_wrong(1, 0, &program_id, "0", &result).is_err());
+        assert!(
+            check_wrong(
+                1,
+                0,
+                &program_id,
+                &instruction_sha,
+                &Err(TransactionError::InvalidAccountIndex)
+            )
+            .is_err()
+        );
+
+        let receipts: Vec<_> = std::fs::read_dir(&evidence_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path().join("vm-receipt.json"))
+            .collect();
+        assert_eq!(
+            receipts.len(),
+            1,
+            "one exact real Ledger original Anchor VM invocation required"
+        );
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipts[0]).unwrap()).unwrap();
+        assert_eq!(receipt["transaction_signature"], signature.to_string());
+        assert_eq!(receipt["transaction_slot"], 1);
+        assert_eq!(receipt["program_id"], program_id.to_string());
+        assert_eq!(receipt["loaded_elf_sha256"], elf_hash);
+        assert_eq!(receipt["vm_result"], "Ok(0)");
+        assert_eq!(receipt["trace_complete"], true);
+        assert_eq!(receipt["historical_ledger_verified"], false);
+        assert_eq!(rooted.transaction_index, 0);
+
+        // Never fabricate independent historical authority: this is
+        // precisely the local Ledger/Bank/VM conjunction for testing.
+        let link_path = receipts[0].parent().unwrap().join("ledger-bank-link.json");
+        let binding = serde_json::json!({
+            "schema": "agave.wp02.local_ledger_bank_vm_join.v1",
+            "rooted_ledger": rooted,
+            "post_bank_programdata": programdata,
+            "observed_scheduler_phases": observed_phases,
+            "vm_receipt_file": "vm-receipt.json",
+            "independent_source_attested": false,
+            "historical_execution_version_attested": false,
+            "external_finality_attested": false,
+        });
+        std::fs::write(link_path, serde_json::to_vec_pretty(&binding).unwrap()).unwrap();
     }
 
     #[test]
