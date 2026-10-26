@@ -22,6 +22,10 @@ name = "solana_svm"
 [features]
 default = ["metrics"]
 agave-unstable-api = []
+historical-vm-capture = [
+    "solana-program-runtime/historical-vm-capture",
+    "solana-syscalls/historical-vm-capture",
+]
 conformance = [
     "dep:agave-precompiles",
     "dep:prost",
@@ -125,6 +129,8 @@ xxhash-rust = { workspace = true, optional = true, features = ["xxh64"] }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
+serde_json = { workspace = true }
+solana-sha256-hasher = { workspace = true, features = ["sha2"] }
 env_logger = { workspace = true }
 libsecp256k1 = { workspace = true }
 rand = { workspace = true }

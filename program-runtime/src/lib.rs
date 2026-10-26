@@ -7,6 +7,8 @@ pub mod cpi;
 pub mod deploy;
 pub mod execution_budget;
 pub mod invoke_context;
+#[cfg(feature = "historical-vm-capture")]
+pub mod historical_vm_capture;
 pub mod loaded_programs;
 pub mod loading_task;
 pub mod mem_pool;

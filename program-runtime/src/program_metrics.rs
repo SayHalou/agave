@@ -13,6 +13,10 @@ use {
 #[derive(Debug, Default)]
 pub struct ProgramStatistics {
     pub uses: AtomicU64,
+    /// Exact original ELF bytes SHA-256 at ProgramCacheEntry::load, not the
+    /// Program ID and not a post-relocation .text digest. Capture-only.
+    #[cfg(feature = "historical-vm-capture")]
+    pub historical_loaded_elf_sha256: std::sync::OnceLock<[u8; 32]>,
 
     pub compilations: AtomicU64,
     pub total_compilation_time_us: AtomicU64,

@@ -310,11 +310,69 @@ pub fn execute<'a, 'b: 'a>(
 
         vm.registers[1] = ebpf::MM_INPUT_START;
         vm.registers[2] = instruction_data_offset as u64;
+
+        // In-band, same-invocation VM evidence. The SVM transaction-scope
+        // token is supplied by execute_loaded_transaction, not the input.
+        // All capture code is compiled out of normal Agave builds.
+        #[cfg(feature = "historical-vm-capture")]
+        let capture_start = {
+            use crate::historical_vm_capture;
+            let initial_r1 = vm.registers[1];
+            let initial_r2 = vm.registers[2];
+            let initial_r10 = vm.registers[10];
+            let capture_ctx = vm.context();
+            let index_height = capture_ctx
+                .transaction_context
+                .get_current_instruction_context()
+                .ok()
+                .map(|ix| (ix.get_index_in_trace(), ix.get_stack_height()));
+            index_height.and_then(|(index_in_trace, stack_height)| {
+                capture_ctx.memory_contexts.memory_mapping().ok().and_then(|mapping| {
+                    historical_vm_capture::begin_vm(
+                        executable,
+                        mapping,
+                        program_id.to_string(),
+                        cache_entry.deployment_slot,
+                        cache_entry.stats.historical_loaded_elf_sha256.get().copied(),
+                        index_in_trace,
+                        stack_height,
+                        instruction_data_offset,
+                        !account_data_direct_mapping,
+                        direct_account_pointers_in_program_input,
+                        initial_r1,
+                        initial_r2,
+                        initial_r10,
+                        parameter_bytes.as_slice(),
+                    )
+                })
+            })
+        };
+
         let mut call_frames =
             MEMORY_POOL.with_borrow_mut(|memory_pool| memory_pool.get_call_frames());
         let (compute_units_consumed, result) =
             vm.execute_program(executable, &mut execution_mode, &mut call_frames);
         let register_trace = std::mem::take(&mut vm.register_trace);
+        #[cfg(feature = "historical-vm-capture")]
+        if let Some(capture) = capture_start {
+            if let Err(error) = crate::historical_vm_capture::finish_vm(
+                capture,
+                &register_trace,
+                parameter_bytes.as_slice(),
+                heap.as_slice(),
+                stack.as_slice(),
+                &format!("{result:?}"),
+                match execution_mode {
+                    ExecutionMode::Interpreted => "Interpreted",
+                    ExecutionMode::Jit => "Jit",
+                    ExecutionMode::PreferJit => "PreferJit",
+                },
+                compute_units_consumed,
+            ) {
+                // Diagnostic IO must not change transaction semantics.
+                log::warn!("Agave historical VM capture unavailable: {error}");
+            }
+        }
         MEMORY_POOL.with_borrow_mut(|memory_pool| {
             memory_pool.put_stack(stack);
             memory_pool.put_heap(heap, mapped_heap_len);

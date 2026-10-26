@@ -3952,3 +3952,157 @@ mod balance_collector {
         }
     }
 }
+
+
+/// WP-02 VM evidence comes from the *real* SVM/Agave program loader in
+/// exactly the same execution thread as the signed transaction. Run the
+/// opt-in environment in a child test process to avoid contaminating parallel
+/// integration tests with a global environment variable.
+#[cfg(feature = "historical-vm-capture")]
+#[test]
+fn historical_vm_capture_same_transaction() {
+    use std::{
+        fs,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    let directory = std::env::temp_dir().join(format!(
+        "agave-wp02-vm-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    if std::env::var_os("AGAVE_HISTORICAL_VM_CAPTURE_TEST_CHILD").is_none() {
+        fs::create_dir(&directory).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("historical_vm_capture_same_transaction")
+            .arg("--nocapture")
+            .env("AGAVE_HISTORICAL_VM_CAPTURE_TEST_CHILD", "1")
+            .env("AGAVE_HISTORICAL_VM_CAPTURE_DIR", &directory)
+            .status()
+            .unwrap();
+        assert!(child.success(), "real SVM child run failed");
+        let expected: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.join("expected-identity.json")).unwrap(),
+        )
+        .unwrap();
+        let captures: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(captures.len(), 1, "one SBF VM must belong to this transaction");
+        let capture = &captures[0];
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(capture.join("vm-receipt.json")).unwrap()).unwrap();
+        assert_eq!(receipt["contract"], "agave.wp02.historical_vm_execution_candidate.v1");
+        assert_eq!(receipt["phase"], "actual_vm_execution_pre_commit");
+        assert_eq!(receipt["transaction_slot"], EXECUTION_SLOT);
+        assert_eq!(receipt["transaction_signature"], expected["signature"]);
+        assert_eq!(receipt["program_id"], expected["program_id"]);
+        assert_eq!(receipt["program_deployment_slot"], DEPLOYMENT_SLOT);
+        assert_eq!(receipt["loaded_elf_sha256"], expected["original_elf_sha256"]);
+        assert_eq!(receipt["source"], "instrumented_agave_program_runtime_not_ledger_attested");
+        assert_eq!(receipt["execution_mode"], "Interpreted");
+        assert_eq!(receipt["trace_complete"], true);
+        assert_eq!(receipt["vm_result"], "Ok(0)");
+        assert_eq!(receipt["historical_ledger_verified"], false);
+        assert_eq!(receipt["bank_state_verified"], false);
+        assert_eq!(receipt["collector_cryptographically_verified"], false);
+        assert_eq!(receipt["current_instruction_root"], "unproven");
+        assert_eq!(receipt["all_path_memory_ssa"], "unproven");
+        assert_eq!(receipt["all_path_pointer_length"], "unproven");
+        assert_eq!(receipt["per_load_bounds"], "unknown");
+        let raw_input = fs::read(capture.join("serialized-before.bin")).unwrap();
+        let sha_hex = |bytes: &[u8]| -> String {
+            solana_sha256_hasher::hash(bytes)
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+        assert_eq!(receipt["serialized_sha256_before"], sha_hex(&raw_input));
+        assert_eq!(receipt["serialized_byte_length"], raw_input.len());
+        // Zero-account aligned SBF parameter ABI: count (u64),
+        // instruction-data length (u64) and program ID (32 bytes).
+        assert!(raw_input.len() >= 8 + 8 + 32);
+        assert_eq!(&raw_input[..8], &0u64.to_le_bytes());
+        let after = fs::read(capture.join("serialized-after.bin")).unwrap();
+        assert_eq!(raw_input.len(), after.len());
+        assert_eq!(receipt["serialized_sha256_after"], sha_hex(&after));
+        let heap = fs::read(capture.join("heap-after.bin")).unwrap();
+        let stack = fs::read(capture.join("stack-after.bin")).unwrap();
+        assert_eq!(receipt["heap_sha256_after"], sha_hex(&heap));
+        assert_eq!(receipt["stack_sha256_after"], sha_hex(&stack));
+        assert_eq!(receipt["heap_byte_length"], heap.len());
+        assert_eq!(receipt["stack_byte_length"], stack.len());
+        let trace_file = fs::read(capture.join("register-trace.jsonl")).unwrap();
+        assert_eq!(receipt["register_trace_sha256"], sha_hex(&trace_file));
+        assert_eq!(receipt["register_trace_bytes"], trace_file.len());
+        let steps: Vec<_> = String::from_utf8(trace_file)
+            .unwrap()
+            .lines()
+            .map(|record| serde_json::from_str::<serde_json::Value>(record).unwrap())
+            .collect();
+        assert!(!steps.is_empty());
+        assert_eq!(steps.len(), receipt["trace_step_count"].as_u64().unwrap() as usize);
+        assert_eq!(steps[0]["registers"][1], receipt["r1_initial"]);
+        assert_eq!(steps[0]["registers"][10], receipt["r10_initial"]);
+        let regions = receipt["vm_regions"].as_array().unwrap();
+        assert!(regions.iter().any(|r| r["label"] == "stack" && r["backing_length"].as_u64().unwrap() > 0));
+        assert!(regions.iter().any(|r| r["label"] == "heap" && r["backing_length"].as_u64().unwrap() > 0));
+        assert!(regions.iter().any(|r| r["label"] == "input" && r["backing_length"].as_u64().unwrap() > 0));
+        // Caller-supplied snapshot is not a verified Ledger/Bank. Root and
+        // Bounds must remain unknown even when a real VM execution succeeds.
+        assert_eq!(receipt["historical_ledger_verified"], false);
+        if std::env::var_os("AGAVE_HISTORICAL_VM_CAPTURE_KEEP_TEST_EVIDENCE").is_some() {
+            eprintln!("WP02_REAL_AGAVE_SVM_EVIDENCE={}", directory.display());
+        } else {
+            fs::remove_dir_all(directory).unwrap();
+        }
+    } else {
+        // The child process is isolated; no concurrent tests inherit its
+        // capture root or evidence identity.
+        let path = std::env::var_os("AGAVE_HISTORICAL_VM_CAPTURE_DIR").unwrap();
+        let output = std::path::Path::new(&path);
+        let mut test_entry = SvmTestEntry::default();
+        let program_name = "hello-solana";
+        let program_id = program_address(program_name);
+        test_entry.add_initial_program(program_name);
+
+        let fee_payer_keypair = Keypair::new();
+        let fee_payer = fee_payer_keypair.pubkey();
+        let mut account = AccountSharedData::default();
+        account.set_lamports(LAMPORTS_PER_SOL);
+        test_entry.add_initial_account(fee_payer, &account);
+        let transaction = Transaction::new_signed_with_payer(
+            &[Instruction::new_with_bytes(program_id, &[], vec![])],
+            Some(&fee_payer),
+            &[&fee_payer_keypair],
+            Hash::default(),
+        );
+        let signature = transaction.signatures[0].to_string();
+        test_entry.push_transaction(transaction);
+        test_entry.decrease_expected_lamports(&fee_payer, LAMPORTS_PER_SIGNATURE);
+        let original = load_program(program_name.to_string());
+        let elf_sha = solana_sha256_hasher::hash(&original).to_bytes();
+        let digest: String = elf_sha.iter().map(|v| format!("{v:02x}")).collect();
+        fs::write(
+            output.join("expected-identity.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "signature": signature,
+                "program_id": program_id.to_string(),
+                "original_elf_sha256": digest,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let env = SvmTestEnvironment::create(test_entry);
+        env.execute();
+    }
+}

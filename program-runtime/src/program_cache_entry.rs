@@ -231,6 +231,15 @@ impl ProgramCacheEntry {
             }
         }
 
+        #[cfg(feature = "historical-vm-capture")]
+        {
+            // Bind the ELF bytes which were actually loaded and verified.
+            // The hash is immutable for this version's ProgramStatistics.
+            let _ = entry_stats.historical_loaded_elf_sha256.set(
+                solana_sha256_hasher::hash(elf_bytes).to_bytes(),
+            );
+        }
+
         Ok(Self {
             deployment_slot,
             account_owner: ProgramCacheEntryOwner::try_from(loader_key).unwrap(),

@@ -1163,6 +1163,13 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
 
         let mut executed_units = 0u64;
 
+        #[cfg(feature = "historical-vm-capture")]
+        let _historical_capture_scope =
+            solana_program_runtime::historical_vm_capture::enter_transaction(
+                self.slot,
+                tx.signature().to_string(),
+            );
+
         let mut invoke_context = InvokeContext::new(
             &mut transaction_context,
             program_cache_for_tx_batch,

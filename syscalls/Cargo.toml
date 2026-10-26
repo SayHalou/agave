@@ -18,6 +18,7 @@ rustdoc-args = ["--cfg=docsrs"]
 [features]
 default = ["metrics"]
 agave-unstable-api = []
+historical-vm-capture = ["solana-program-runtime/historical-vm-capture"]
 metrics = ["solana-program-runtime/metrics"]
 shuttle-test = [
     "solana-program-runtime/shuttle-test",

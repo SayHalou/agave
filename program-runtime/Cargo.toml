@@ -21,6 +21,9 @@ name = "solana_program_runtime"
 
 [features]
 agave-unstable-api = []
+# Diagnostic VM capture is compiled out by default. The collector is also
+# inactive until an explicit directory is supplied by the operator.
+historical-vm-capture = ["dep:serde_json", "dep:solana-sha256-hasher"]
 conf-stack-frame-size = ["solana-sbpf/conf-stack-frame-size"]
 dev-context-only-utils = [
     "dep:qualifier_attr",
@@ -39,6 +42,8 @@ itertools = { workspace = true }
 log = { workspace = true }
 qualifier_attr = { workspace = true, optional = true }
 rand = { workspace = true }
+serde_json = { workspace = true, optional = true }
+solana-sha256-hasher = { workspace = true, optional = true, features = ["sha2"] }
 solana-account = { workspace = true, features = ["wincode"] }
 solana-account-info = { workspace = true }
 solana-clock = { workspace = true, features = ["sysvar", "wincode"] }

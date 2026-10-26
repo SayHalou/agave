@@ -347,7 +347,9 @@ pub fn create_program_runtime_environment(
         enable_stack_frame_gaps: !feature_set.virtual_address_space_adjustments,
         instruction_meter_checkpoint_distance: 10000,
         enable_instruction_meter: true,
-        enable_register_tracing: debugging_features,
+        enable_register_tracing: debugging_features
+            || (cfg!(feature = "historical-vm-capture")
+                && std::env::var_os("AGAVE_HISTORICAL_VM_CAPTURE_DIR").is_some()),
         enable_symbol_and_section_labels: debugging_features,
         reject_broken_elfs: reject_deployment_of_broken_elfs,
         noop_instruction_rate: 256,

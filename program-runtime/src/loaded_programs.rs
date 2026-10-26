@@ -1841,6 +1841,8 @@ pub(crate) mod tests {
             interpreted_invocations: 6.into(),
             total_interpretation_time_us: 7.into(),
             interpretation_time_ema: 300.into(),
+            #[cfg(feature = "historical-vm-capture")]
+            historical_loaded_elf_sha256: std::sync::OnceLock::new(),
         });
         let unloaded = Arc::new(ProgramCacheEntry {
             program: ProgramCacheEntryType::Unloaded(env.clone()),
