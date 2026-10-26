@@ -73,6 +73,55 @@ fn elf_hash(sha: Option<[u8; 32]>) -> Option<String> {
     sha.map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Source bytes of one *actual* mapped VM input region. Direct-mapped
+/// accounts are intentionally distinct from serialized parameter storage.
+struct InputBackingSnapshot {
+    region_index: usize,
+    virtual_start: u64,
+    serialized_backing_offset: Option<usize>,
+    bytes: Vec<u8>,
+}
+
+fn snapshot_input_regions(
+    mapping: &MemoryMapping,
+    serialized: &[u8],
+) -> Option<Vec<InputBackingSnapshot>> {
+    let mut total = 0usize;
+    let mut result = Vec::new();
+    let serialized_start = serialized.as_ptr() as usize;
+    let serialized_end = serialized_start.checked_add(serialized.len())?;
+    for (region_index, region) in mapping.get_regions().iter().enumerate() {
+        let address = region.vm_addr_range().start;
+        if address >> 32 != 4 {
+            continue;
+        }
+        let len = region.len();
+        total = total.checked_add(len)?;
+        if total > MAX_SERIALIZED_BYTES || result.len() >= 512 {
+            return None;
+        }
+        let backing = region.host_buffer();
+        let host_addr = backing.ptr().cast::<u8>() as usize;
+        let host_end = host_addr.checked_add(len)?;
+        let offset = if host_addr >= serialized_start && host_end <= serialized_end {
+            Some(host_addr - serialized_start)
+        } else {
+            None
+        };
+        // SAFETY: The actual MemoryMapping is borrowed while the entire VM
+        // invocation owns all serialized / account backing allocations.
+        // Reads occur only outside execute_program and never mutate backing.
+        let bytes = unsafe { (&*backing.ptr()).to_vec() };
+        result.push(InputBackingSnapshot {
+            region_index,
+            virtual_start: address,
+            serialized_backing_offset: offset,
+            bytes,
+        });
+    }
+    Some(result)
+}
+
 pub struct VmCaptureStart {
     scope: TransactionScope,
     program_id: String,
@@ -80,6 +129,7 @@ pub struct VmCaptureStart {
     loaded_elf_sha256: Option<String>,
     executable_text_sha256: String,
     executable_text_vaddr: u64,
+    executable_text_bytes: Vec<u8>,
     instruction_index_in_trace: usize,
     instruction_stack_height: usize,
     instruction_data_offset: usize,
@@ -92,6 +142,7 @@ pub struct VmCaptureStart {
     heap_mapped_bytes: usize,
     stack_mapped_bytes: usize,
     serialized_before: Vec<u8>,
+    input_regions_before: Vec<InputBackingSnapshot>,
 }
 
 /// Capture only evidence already present at the real Agave VM launch. Does
@@ -118,7 +169,12 @@ pub fn begin_vm<C: ContextObject>(
         log::warn!("historical VM capture omitted: serialized image over budget");
         return None;
     }
+    let input_regions_before = snapshot_input_regions(mapping, serialized_before)?;
     let (text_vaddr, text) = executable.get_text_bytes();
+    if text.len() > MAX_SERIALIZED_BYTES {
+        log::warn!("historical VM capture omitted: executing text over budget");
+        return None;
+    }
     // The memory pool can own a larger buffer than the guest VM actually
     // maps. Capture only the real MemoryRegion backing, never pool tails.
     let heap_mapped_bytes = mapping
@@ -161,6 +217,7 @@ pub fn begin_vm<C: ContextObject>(
         loaded_elf_sha256: elf_hash(loaded_elf_sha256),
         executable_text_sha256: digest(text),
         executable_text_vaddr: text_vaddr,
+        executable_text_bytes: text.to_vec(),
         instruction_index_in_trace,
         instruction_stack_height,
         instruction_data_offset,
@@ -173,6 +230,7 @@ pub fn begin_vm<C: ContextObject>(
         heap_mapped_bytes,
         stack_mapped_bytes,
         serialized_before: serialized_before.to_vec(),
+        input_regions_before,
     })
 }
 
@@ -180,6 +238,7 @@ pub fn begin_vm<C: ContextObject>(
 /// The caller retains the original register trace unchanged for CPI handling.
 pub fn finish_vm(
     capture: VmCaptureStart,
+    mapping: &MemoryMapping,
     register_trace: &[[u64; 12]],
     serialized_after: &[u8],
     heap_after: &[u8],
@@ -203,6 +262,65 @@ pub fn finish_vm(
             "historical VM capture over evidence budget",
         ));
     }
+    let input_regions_after = snapshot_input_regions(mapping, serialized_after)
+        .ok_or_else(|| io::Error::other("input VM region snapshots over budget"))?;
+    if input_regions_after.len() != capture.input_regions_before.len() {
+        return Err(io::Error::other(
+            "input VM region count changed during execution",
+        ));
+    }
+    for (before, after) in capture
+        .input_regions_before
+        .iter()
+        .zip(&input_regions_after)
+    {
+        if before.region_index != after.region_index
+            || before.virtual_start != after.virtual_start
+            || before.serialized_backing_offset != after.serialized_backing_offset
+            || (before.serialized_backing_offset.is_some()
+                && before.bytes.len() != after.bytes.len())
+        {
+            return Err(io::Error::other(format!(
+                "input VM backing identity changed during execution: \
+                 before index={} vm={:#x} source={:?} bytes={}, \
+                 after index={} vm={:#x} source={:?} bytes={}",
+                before.region_index,
+                before.virtual_start,
+                before.serialized_backing_offset,
+                before.bytes.len(),
+                after.region_index,
+                after.virtual_start,
+                after.serialized_backing_offset,
+                after.bytes.len(),
+            )));
+        }
+    }
+    // CPI may legitimately resize an account's mapped backing (e.g. PDA
+    // initialize: zero bytes before -> 49 bytes after). Preserve both maps;
+    // a consumer must never replay the postimage against a stale pre-map.
+    let post_vm_regions: Vec<Value> = mapping
+        .get_regions()
+        .iter()
+        .map(|region| {
+            let range = region.vm_addr_range();
+            let label = match range.start >> 32 {
+                1 => "program",
+                2 => "stack",
+                3 => "heap",
+                4 => "input",
+                _ => "other",
+            };
+            json!({
+                "label": label,
+                "virtual_start": range.start,
+                "virtual_extent": range.end.saturating_sub(range.start),
+                "backing_length": region.len(),
+                "readable": true,
+                "writable": region.host_buffer().is_mutable(),
+                "gap_bytes": region.gap_size(),
+            })
+        })
+        .collect();
     // The directory is selected explicitly by the operator, not by data
     // inside a transaction. Components cannot traverse out of this root.
     fs::create_dir_all(&capture.scope.directory)?;
@@ -222,8 +340,32 @@ pub fn finish_vm(
         file.write_all(bytes)?;
         file.sync_all()
     };
+    write_new("executed-text.bin", &capture.executable_text_bytes)?;
     write_new("serialized-before.bin", &capture.serialized_before)?;
     write_new("serialized-after.bin", serialized_after)?;
+    let mut input_backing_receipts = Vec::new();
+    for (before, after) in capture
+        .input_regions_before
+        .iter()
+        .zip(&input_regions_after)
+    {
+        let name_before = format!("input-region-{}-before.bin", before.region_index);
+        let name_after = format!("input-region-{}-after.bin", after.region_index);
+        write_new(&name_before, &before.bytes)?;
+        write_new(&name_after, &after.bytes)?;
+        input_backing_receipts.push(json!({
+            "region_index": before.region_index,
+            "virtual_start": before.virtual_start,
+            "backing_length": before.bytes.len(),
+            "after_backing_length": after.bytes.len(),
+            "mapping_revision": before.bytes.len() != after.bytes.len(),
+            "serialized_backing_offset": before.serialized_backing_offset,
+            "before_file": name_before,
+            "after_file": name_after,
+            "before_sha256": digest(&before.bytes),
+            "after_sha256": digest(&after.bytes),
+        }));
+    }
     write_new("heap-after.bin", heap_after)?;
     write_new("stack-after.bin", stack_after)?;
     {
@@ -256,7 +398,7 @@ pub fn finish_vm(
     // This is a *local execution* metadata receipt. In particular, the slot
     // and signature were taken from SVM's actual executing transaction but
     // have not been externally verified against a Ledger/Bank.
-    let receipt = json!({
+    let mut receipt = json!({
         "contract": "agave.wp02.historical_vm_execution_candidate.v1",
         "source": "instrumented_agave_program_runtime_not_ledger_attested",
         "phase": "actual_vm_execution_pre_commit",
@@ -300,6 +442,9 @@ pub fn finish_vm(
         "all_path_pointer_length": "unproven",
         "per_load_bounds": "unknown",
     });
+    receipt["vm_input_backing_regions"] = json!(input_backing_receipts);
+    receipt["vm_regions_after"] = json!(post_vm_regions);
+    receipt["executed_text_byte_length"] = json!(capture.executable_text_bytes.len());
     let encoded = serde_json::to_vec_pretty(&receipt)?;
     write_new("vm-receipt.json", &encoded)?;
     Ok(capture_dir)

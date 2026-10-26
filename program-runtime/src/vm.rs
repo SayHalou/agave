@@ -327,24 +327,32 @@ pub fn execute<'a, 'b: 'a>(
                 .ok()
                 .map(|ix| (ix.get_index_in_trace(), ix.get_stack_height()));
             index_height.and_then(|(index_in_trace, stack_height)| {
-                capture_ctx.memory_contexts.memory_mapping().ok().and_then(|mapping| {
-                    historical_vm_capture::begin_vm(
-                        executable,
-                        mapping,
-                        program_id.to_string(),
-                        cache_entry.deployment_slot,
-                        cache_entry.stats.historical_loaded_elf_sha256.get().copied(),
-                        index_in_trace,
-                        stack_height,
-                        instruction_data_offset,
-                        !account_data_direct_mapping,
-                        direct_account_pointers_in_program_input,
-                        initial_r1,
-                        initial_r2,
-                        initial_r10,
-                        parameter_bytes.as_slice(),
-                    )
-                })
+                capture_ctx
+                    .memory_contexts
+                    .memory_mapping()
+                    .ok()
+                    .and_then(|mapping| {
+                        historical_vm_capture::begin_vm(
+                            executable,
+                            mapping,
+                            program_id.to_string(),
+                            cache_entry.deployment_slot,
+                            cache_entry
+                                .stats
+                                .historical_loaded_elf_sha256
+                                .get()
+                                .copied(),
+                            index_in_trace,
+                            stack_height,
+                            instruction_data_offset,
+                            !account_data_direct_mapping,
+                            direct_account_pointers_in_program_input,
+                            initial_r1,
+                            initial_r2,
+                            initial_r10,
+                            parameter_bytes.as_slice(),
+                        )
+                    })
             })
         };
 
@@ -355,22 +363,37 @@ pub fn execute<'a, 'b: 'a>(
         let register_trace = std::mem::take(&mut vm.register_trace);
         #[cfg(feature = "historical-vm-capture")]
         if let Some(capture) = capture_start {
-            if let Err(error) = crate::historical_vm_capture::finish_vm(
-                capture,
-                &register_trace,
-                parameter_bytes.as_slice(),
-                heap.as_slice(),
-                stack.as_slice(),
-                &format!("{result:?}"),
-                match execution_mode {
-                    ExecutionMode::Interpreted => "Interpreted",
-                    ExecutionMode::Jit => "Jit",
-                    ExecutionMode::PreferJit => "PreferJit",
-                },
-                compute_units_consumed,
-            ) {
-                // Diagnostic IO must not change transaction semantics.
-                log::warn!("Agave historical VM capture unavailable: {error}");
+            // Snapshot the *same* live VM mapping after execution, before
+            // returning pooled memory to Agave. No guessed account backing.
+            match vm.context().memory_contexts.memory_mapping() {
+                Ok(mapping) => {
+                    if let Err(error) = crate::historical_vm_capture::finish_vm(
+                        capture,
+                        mapping,
+                        &register_trace,
+                        parameter_bytes.as_slice(),
+                        heap.as_slice(),
+                        stack.as_slice(),
+                        &format!("{result:?}"),
+                        match execution_mode {
+                            ExecutionMode::Interpreted => "Interpreted",
+                            ExecutionMode::Jit => "Jit",
+                            ExecutionMode::PreferJit => "PreferJit",
+                        },
+                        compute_units_consumed,
+                    ) {
+                        log::warn!("Agave historical VM capture unavailable: {error}");
+                        if std::env::var_os("AGAVE_HISTORICAL_VM_CAPTURE_DIAGNOSTICS").is_some() {
+                            eprintln!("A17 VM capture diagnostic: {error}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::warn!("Agave historical VM post-mapping unavailable: {error}");
+                    if std::env::var_os("AGAVE_HISTORICAL_VM_CAPTURE_DIAGNOSTICS").is_some() {
+                        eprintln!("A17 VM mapping diagnostic: {error}");
+                    }
+                }
             }
         }
         MEMORY_POOL.with_borrow_mut(|memory_pool| {

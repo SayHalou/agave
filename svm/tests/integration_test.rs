@@ -141,11 +141,27 @@ impl SvmTestEnvironment<'_> {
         }
 
         let fork_graph = Arc::new(RwLock::new(MockForkGraph {}));
+        // A1.7 explicit opt-in original-ELF probe must use the same
+        // feature-gated syscall registration as Agave production; the
+        // legacy integration-test loader omits PDA syscalls used by Anchor.
+        #[cfg(feature = "historical-vm-capture")]
+        let loader =
+            if std::env::var_os("AGAVE_A17_ORIGINAL_ELF").is_some() {
+                solana_syscalls::create_program_runtime_environment(
+                &test_entry.feature_set,
+                &solana_program_runtime::execution_budget::SVMTransactionExecutionBudget::default(),
+                true, true,
+            ).expect("authentic Agave syscall registry")
+            } else {
+                create_custom_loader()
+            };
+        #[cfg(not(feature = "historical-vm-capture"))]
+        let loader = create_custom_loader();
         let batch_processor = TransactionBatchProcessor::new(
             EXECUTION_SLOT,
             EXECUTION_EPOCH,
             Arc::downgrade(&fork_graph),
-            Some(create_custom_loader()),
+            Some(loader),
         );
 
         // The sysvars must be put in the cache
@@ -3953,7 +3969,6 @@ mod balance_collector {
     }
 }
 
-
 /// WP-02 VM evidence comes from the *real* SVM/Agave program loader in
 /// exactly the same execution thread as the signed transaction. Run the
 /// opt-in environment in a child test process to avoid contaminating parallel
@@ -3986,27 +4001,39 @@ fn historical_vm_capture_same_transaction() {
             .status()
             .unwrap();
         assert!(child.success(), "real SVM child run failed");
-        let expected: serde_json::Value = serde_json::from_slice(
-            &fs::read(directory.join("expected-identity.json")).unwrap(),
-        )
-        .unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("expected-identity.json")).unwrap())
+                .unwrap();
         let captures: Vec<_> = fs::read_dir(&directory)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.is_dir())
             .collect();
-        assert_eq!(captures.len(), 1, "one SBF VM must belong to this transaction");
+        assert_eq!(
+            captures.len(),
+            1,
+            "one SBF VM must belong to this transaction"
+        );
         let capture = &captures[0];
         let receipt: serde_json::Value =
             serde_json::from_slice(&fs::read(capture.join("vm-receipt.json")).unwrap()).unwrap();
-        assert_eq!(receipt["contract"], "agave.wp02.historical_vm_execution_candidate.v1");
+        assert_eq!(
+            receipt["contract"],
+            "agave.wp02.historical_vm_execution_candidate.v1"
+        );
         assert_eq!(receipt["phase"], "actual_vm_execution_pre_commit");
         assert_eq!(receipt["transaction_slot"], EXECUTION_SLOT);
         assert_eq!(receipt["transaction_signature"], expected["signature"]);
         assert_eq!(receipt["program_id"], expected["program_id"]);
         assert_eq!(receipt["program_deployment_slot"], DEPLOYMENT_SLOT);
-        assert_eq!(receipt["loaded_elf_sha256"], expected["original_elf_sha256"]);
-        assert_eq!(receipt["source"], "instrumented_agave_program_runtime_not_ledger_attested");
+        assert_eq!(
+            receipt["loaded_elf_sha256"],
+            expected["original_elf_sha256"]
+        );
+        assert_eq!(
+            receipt["source"],
+            "instrumented_agave_program_runtime_not_ledger_attested"
+        );
         assert_eq!(receipt["execution_mode"], "Interpreted");
         assert_eq!(receipt["trace_complete"], true);
         assert_eq!(receipt["vm_result"], "Ok(0)");
@@ -4049,14 +4076,19 @@ fn historical_vm_capture_same_transaction() {
             .map(|record| serde_json::from_str::<serde_json::Value>(record).unwrap())
             .collect();
         assert!(!steps.is_empty());
-        assert_eq!(steps.len(), receipt["trace_step_count"].as_u64().unwrap() as usize);
+        assert_eq!(
+            steps.len(),
+            receipt["trace_step_count"].as_u64().unwrap() as usize
+        );
         assert_eq!(steps[0]["registers"][1], receipt["r1_initial"]);
         assert_eq!(steps[0]["registers"][10], receipt["r10_initial"]);
         let regions = receipt["vm_regions"].as_array().unwrap();
         assert!(regions.iter().any(|r| r["label"] == "stack"
             && r["backing_length"].as_u64().unwrap() == stack.len() as u64));
-        assert!(regions.iter().any(|r| r["label"] == "heap"
-            && r["backing_length"].as_u64().unwrap() == heap.len() as u64));
+        assert!(
+            regions.iter().any(|r| r["label"] == "heap"
+                && r["backing_length"].as_u64().unwrap() == heap.len() as u64)
+        );
         assert!(regions.iter().any(|r| r["label"] == "input"
             && r["backing_length"].as_u64().unwrap() == raw_input.len() as u64));
         // Caller-supplied snapshot is not a verified Ledger/Bank. Root and
@@ -4108,4 +4140,197 @@ fn historical_vm_capture_same_transaction() {
         let env = SvmTestEnvironment::create(test_entry);
         env.execute();
     }
+}
+
+/// A1.7: opt-in external exact-ELF execution on the *actual* Agave SVM,
+/// with real ProgramData bank bytes and VM instrumentation. No historical
+/// Ledger/Bank authority is implied by this synthetic test transaction.
+/// The fixture path is never activated by CI or untrusted transaction data.
+#[cfg(feature = "historical-vm-capture")]
+#[test]
+#[ignore = "requires AGAVE_A17_ORIGINAL_ELF and explicit VM capture directory"]
+fn historical_vm_capture_anchor_original_elf() {
+    use std::fs;
+    let path =
+        std::env::var_os("AGAVE_A17_ORIGINAL_ELF").expect("explicit source-ELF path required");
+    assert!(std::env::var_os("AGAVE_HISTORICAL_VM_CAPTURE_DIR").is_some());
+    let original = fs::read(path).expect("read exact original Anchor ELF");
+    let expected_sha = "9503a43e8ca143c6a89370739ef677a9707dfe86dd5976781da18b6c3253d3e5";
+    let digest = solana_sha256_hasher::hash(&original).to_bytes();
+    let digest_hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(digest_hex, expected_sha, "cross-ELF substitution forbidden");
+    // Source-built Anchor fixture declared ID, separately from ELF SHA.
+    // This is a local program identity for controlled SVM, NOT Ledger proof.
+    let program_id: Pubkey = "6vLKHpfrexFX4fdQTVnGRLSVDuUtxc5zh9oRkWtLcRRS"
+        .parse()
+        .unwrap();
+    let program_data_id = get_program_data_address(&program_id);
+
+    // Program & ProgramData account bytes are installed into MockBank
+    // before ProgramCache load, with exactly the frozen Anchor ELF.
+    let mut invocation_results: HashMap<String, String> = HashMap::new();
+    for account_count in 0..=3 {
+        let mut entry = SvmTestEntry::default();
+        let payer_keypair = Keypair::new();
+        let payer = payer_keypair.pubkey();
+        let mut payer_account = AccountSharedData::default();
+        payer_account.set_lamports(5 * LAMPORTS_PER_SOL);
+        entry.add_initial_account(payer, &payer_account);
+        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", payer.as_ref()], &program_id);
+        let mut metas = vec![
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(payer, true),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ];
+        metas.truncate(account_count);
+        // Anchor 0.32.1 source-built program: initialize selector, u64 args.
+        // These bytes only select a candidate handler, never certify routing.
+        let instruction_data = [
+            0xaf, 0xaf, 0x6d, 0x1f, 0x0d, 0x98, 0x9b, 0xed, 7, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let transaction = Transaction::new_signed_with_payer(
+            &[Instruction::new_with_bytes(
+                program_id,
+                &instruction_data,
+                metas,
+            )],
+            Some(&payer),
+            &[&payer_keypair],
+            Hash::default(),
+        );
+        let signature = transaction.signatures[0].to_string();
+        entry.push_transaction(transaction);
+        let env = SvmTestEnvironment::create(entry);
+        let mut loader_metrics =
+            solana_program_runtime::program_metrics::LoadProgramMetrics::default();
+        let load_check = solana_program_runtime::program_cache_entry::ProgramCacheEntry::load(
+            &bpf_loader_upgradeable::id(),
+            solana_program_runtime::loaded_programs::ProgramRuntimeEnvironment::clone(
+                env.processing_environment
+                    .program_runtime_environments
+                    .get_env_for_execution(),
+            ),
+            DEPLOYMENT_SLOT,
+            &original,
+            &mut loader_metrics,
+        );
+        assert!(
+            load_check.is_ok(),
+            "Agave original Anchor ELF rejected: {:?}",
+            load_check.err()
+        );
+        let state = UpgradeableLoaderState::ProgramData {
+            slot: DEPLOYMENT_SLOT,
+            upgrade_authority_address: None,
+        };
+        let metadata_size = UpgradeableLoaderState::size_of_programdata_metadata();
+        let size = metadata_size + original.len();
+        let rent = Rent::default();
+        let mut data_account = AccountSharedData::new_data_with_space(
+            rent.minimum_balance(size),
+            &state,
+            size,
+            &bpf_loader_upgradeable::id(),
+        )
+        .unwrap();
+        data_account.data_as_mut_slice()[metadata_size..].copy_from_slice(&original);
+        let program_state = UpgradeableLoaderState::Program {
+            programdata_address: program_data_id,
+        };
+        let mut program_account =
+            AccountSharedData::new_data(0, &program_state, &bpf_loader_upgradeable::id()).unwrap();
+        program_account.set_lamports(rent.minimum_balance(program_account.data().len()));
+        program_account.set_executable(true);
+        {
+            let mut bank = env.mock_bank.account_shared_data.write().unwrap();
+            bank.insert(program_data_id, data_account);
+            bank.insert(program_id, program_account);
+        }
+
+        let (transactions, checked) = env.test_entry.prepare_transactions();
+        let result = env.batch_processor.load_and_execute_sanitized_transactions(
+            &env.mock_bank,
+            &transactions,
+            checked,
+            &env.processing_environment,
+            &env.processing_config,
+        );
+        assert_eq!(result.processing_results.len(), 1);
+        match &result.processing_results[0] {
+            Ok(ProcessedTransaction::Executed(executed)) => {
+                assert!(
+                    executed.execution_details.executed_units > 0,
+                    "ProgramCache tombstone is not an executed VM"
+                );
+                if account_count == 3 {
+                    assert!(
+                        executed.execution_details.status.is_ok(),
+                        "Full original Anchor handler and CPI must succeed"
+                    );
+                    let (_, state) = executed
+                        .loaded_transaction
+                        .accounts
+                        .iter()
+                        .find(|(key, _)| *key == vault_pda)
+                        .expect("initialized PDA must be retained in transaction accounts");
+                    assert_eq!(state.owner(), &program_id);
+                    assert_eq!(state.data().len(), 8 + 32 + 8 + 1);
+                    assert_eq!(&state.data()[8..40], payer.as_ref());
+                    assert_eq!(&state.data()[40..48], &7u64.to_le_bytes());
+                } else {
+                    assert_eq!(
+                        format!("{:?}", executed.execution_details.status),
+                        "Err(InstructionError(0, Custom(3005)))",
+                        "Incomplete Anchor accounts must fail in expected Handler validation",
+                    );
+                }
+                let vm_result = if account_count == 3 {
+                    "Ok(0)"
+                } else {
+                    "Ok(3005)"
+                };
+                invocation_results.insert(signature.clone(), vm_result.to_owned());
+                eprintln!(
+                    "A17_ACTUAL_AGAVE_ANCHOR account_count={account_count} \
+                     elf_sha256={digest_hex} program_id={program_id} \
+                     signature={signature} instruction_status={:?} units={}",
+                    executed.execution_details.status, executed.execution_details.executed_units,
+                );
+            }
+            other => panic!("SVM rejected before actual VM execution: {other:?}"),
+        }
+    }
+    // An executed transaction is not enough: all four original VM invocations
+    // must emit complete in-band receipts, including successful CPI resize.
+    let root =
+        std::path::PathBuf::from(std::env::var_os("AGAVE_HISTORICAL_VM_CAPTURE_DIR").unwrap());
+    let capture_dirs: Vec<_> = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect();
+    assert_eq!(
+        capture_dirs.len(),
+        4,
+        "all Anchor VM receipts must be present"
+    );
+    for directory in capture_dirs {
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("vm-receipt.json")).unwrap()).unwrap();
+        assert_eq!(receipt["loaded_elf_sha256"], digest_hex);
+        assert_eq!(receipt["program_id"], program_id.to_string());
+        let signature = receipt["transaction_signature"].as_str().unwrap();
+        let matching_vm_result = invocation_results
+            .remove(signature)
+            .expect("Receipt must match exactly one executed signed transaction");
+        assert_eq!(receipt["vm_result"], matching_vm_result);
+        assert_eq!(receipt["trace_complete"], true);
+        assert!(receipt["trace_step_count"].as_u64().unwrap() > 0);
+        assert_eq!(receipt["historical_ledger_verified"], false);
+        assert_eq!(receipt["bank_state_verified"], false);
+    }
+    assert!(
+        invocation_results.is_empty(),
+        "No signed test invocation may lack a same-transaction VM Receipt"
+    );
 }
