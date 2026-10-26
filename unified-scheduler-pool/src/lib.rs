@@ -20,7 +20,7 @@ use {
     },
     assert_matches::assert_matches,
     crossbeam_channel::{
-        self, Receiver, RecvError, RecvTimeoutError, SendError, Sender, never, select_biased,
+        self, never, select_biased, Receiver, RecvError, RecvTimeoutError, SendError, Sender,
     },
     crossbeam_utils::CachePadded,
     dashmap::DashMap,
@@ -33,14 +33,15 @@ use {
     solana_runtime::{
         bank::Bank,
         installed_scheduler_pool::{
-            InstalledScheduler, InstalledSchedulerBox, InstalledSchedulerPool, ResultWithTimings,
-            ScheduleResult, SchedulerAborted, SchedulerId, SchedulingContext, TimeoutListener,
-            UninstalledScheduler, UninstalledSchedulerBox, initialized_result_with_timings,
+            initialized_result_with_timings, InstalledScheduler, InstalledSchedulerBox,
+            InstalledSchedulerPool, ResultWithTimings, ScheduleResult, SchedulerAborted,
+            SchedulerId, SchedulingContext, TimeoutListener, UninstalledScheduler,
+            UninstalledSchedulerBox,
         },
         prioritization_fee_cache::PrioritizationFeeCache,
         transaction_execution::{
-            TransactionBatchWithIndexes, TransactionStatusSender, check_block_cost_limits,
-            execute_batch,
+            check_block_cost_limits, execute_batch_with_historical_observer,
+            HistoricalExecutionObserver, TransactionBatchWithIndexes, TransactionStatusSender,
         },
         vote_sender_types::{ReplayVoteSendType, ReplayVoteSender},
     },
@@ -56,10 +57,10 @@ use {
         marker::PhantomData,
         mem,
         sync::{
-            Arc, Mutex, OnceLock, Weak,
             atomic::{AtomicU64, Ordering::Relaxed},
+            Arc, Mutex, OnceLock, Weak,
         },
-        thread::{self, JoinHandle, sleep},
+        thread::{self, sleep, JoinHandle},
         time::{Duration, Instant},
     },
 };
@@ -164,6 +165,8 @@ pub struct HandlerContext {
     transaction_status_sender: Option<TransactionStatusSender>,
     replay_vote_sender: Option<ReplayVoteSender>,
     prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+    #[debug(skip)]
+    historical_observer: Option<Arc<dyn HistoricalExecutionObserver + Send + Sync>>,
 }
 
 impl HandlerContext {
@@ -178,12 +181,14 @@ impl HandlerContext {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(derive_more::Debug, Clone)]
 struct CommonHandlerContext {
     log_messages_bytes_limit: Option<usize>,
     transaction_status_sender: Option<TransactionStatusSender>,
     replay_vote_sender: Option<ReplayVoteSender>,
     prioritization_fee_cache: Option<Arc<PrioritizationFeeCache>>,
+    #[debug(skip)]
+    historical_observer: Arc<Mutex<Option<Arc<dyn HistoricalExecutionObserver + Send + Sync>>>>,
 }
 
 impl CommonHandlerContext {
@@ -193,6 +198,7 @@ impl CommonHandlerContext {
             transaction_status_sender,
             replay_vote_sender,
             prioritization_fee_cache,
+            historical_observer,
         } = self;
 
         HandlerContext {
@@ -201,6 +207,7 @@ impl CommonHandlerContext {
             transaction_status_sender,
             replay_vote_sender,
             prioritization_fee_cache,
+            historical_observer: historical_observer.lock().unwrap().clone(),
         }
     }
 }
@@ -254,6 +261,20 @@ where
             DEFAULT_MAX_USAGE_QUEUE_COUNT,
             DEFAULT_TIMEOUT_DURATION,
         )
+    }
+
+    /// Configure opt-in historical observation before replay creates schedulers.
+    pub fn set_historical_observer(
+        pool: &mut Arc<Self>,
+        observer: Arc<dyn HistoricalExecutionObserver + Send + Sync>,
+    ) -> std::result::Result<(), &'static str> {
+        let mut guard = pool
+            .common_handler_context
+            .historical_observer
+            .lock()
+            .map_err(|_| "observer lock poisoned")?;
+        *guard = Some(observer);
+        Ok(())
     }
 
     #[cfg(feature = "dev-context-only-utils")]
@@ -445,6 +466,7 @@ where
             trashed_scheduler_inners: Mutex::default(),
             timeout_listeners: Mutex::default(),
             common_handler_context: CommonHandlerContext {
+                historical_observer: Arc::new(Mutex::new(None)),
                 log_messages_bytes_limit,
                 transaction_status_sender,
                 replay_vote_sender,
@@ -670,7 +692,7 @@ impl TaskHandler for DefaultTaskHandler {
             transaction_indexes,
         };
 
-        let result = execute_batch(
+        let result = execute_batch_with_historical_observer(
             &batch_with_indexes,
             bank,
             handler_context.transaction_status_sender.as_ref(),
@@ -682,6 +704,7 @@ impl TaskHandler for DefaultTaskHandler {
             timings,
             handler_context.log_messages_bytes_limit,
             handler_context.prioritization_fee_cache.as_deref(),
+            handler_context.historical_observer.as_deref(),
         )
         .map(|tx_costs| tx_costs[0].tracked_cost());
         sleepless_testing::at(CheckPoint::TaskHandled(task_id));
@@ -1224,11 +1247,10 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
     }
 
     fn put_session_result_with_timings(&mut self, result_with_timings: ResultWithTimings) {
-        assert!(
-            self.session_result_with_timings
-                .replace(result_with_timings)
-                .is_none()
-        );
+        assert!(self
+            .session_result_with_timings
+            .replace(result_with_timings)
+            .is_none());
     }
 
     // This method must take same set of session-related arguments as start_session() to avoid
@@ -1397,7 +1419,11 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
             move || {
                 let (do_now, dont_now) = (&disconnected::<()>(), &never::<()>());
                 let dummy_receiver = |trigger| {
-                    if trigger { do_now } else { dont_now }
+                    if trigger {
+                        do_now
+                    } else {
+                        dont_now
+                    }
                 };
 
                 let mut state_machine = unsafe {
@@ -1562,11 +1588,9 @@ impl<S: SpawnableScheduler<TH>, TH: TaskHandler> ThreadManager<S, TH> {
                             }
                             Ok(NewTaskPayload::OpenSubchannel(context_and_result_with_timings)) => {
                                 let new_context = context_and_result_with_timings.0;
-                                assert!(
-                                    new_result_with_timings
-                                        .replace(context_and_result_with_timings.1)
-                                        .is_none()
-                                );
+                                assert!(new_result_with_timings
+                                    .replace(context_and_result_with_timings.1)
+                                    .is_none());
                                 // We just received subsequent (= not initial) session and about to
                                 // enter into the preceding `while(!is_finished) {...}` loop again.
                                 // Before that, propagate new SchedulingContext to handler threads
@@ -2065,8 +2089,8 @@ mod tests {
             bank::{Bank, SlotLeader},
             bank_forks::BankForks,
             genesis_utils::{
-                GenesisConfigInfo, bootstrap_validator_stake_lamports, create_genesis_config,
-                create_genesis_config_with_leader,
+                bootstrap_validator_stake_lamports, create_genesis_config,
+                create_genesis_config_with_leader, GenesisConfigInfo,
             },
             installed_scheduler_pool::{
                 BankWithScheduler, InstalledSchedulerPoolArc, SchedulingContext,
@@ -3013,17 +3037,13 @@ mod tests {
         // shouldn't be touched
         {
             let mut bank_forks_w = bank_forks.write().unwrap();
-            assert!(
-                !bank_forks_w
-                    .working_bank_with_scheduler()
-                    .has_installed_scheduler()
-            );
+            assert!(!bank_forks_w
+                .working_bank_with_scheduler()
+                .has_installed_scheduler());
             bank_forks_w.install_scheduler_pool(pool);
-            assert!(
-                !bank_forks_w
-                    .working_bank_with_scheduler()
-                    .has_installed_scheduler()
-            );
+            assert!(!bank_forks_w
+                .working_bank_with_scheduler()
+                .has_installed_scheduler());
         }
 
         // child_bank inserted after pool so it gets a scheduler
@@ -3042,6 +3062,73 @@ mod tests {
         let bank = bank_fork.read().unwrap().get(slot).unwrap();
         bank.set_fork_graph_in_program_cache(Arc::downgrade(&bank_fork));
         (bank, bank_fork)
+    }
+
+    #[derive(Default)]
+    struct HistoricalTestObserver {
+        events: Mutex<Vec<&'static str>>,
+        reject_pre_commit: bool,
+    }
+
+    impl HistoricalExecutionObserver for HistoricalTestObserver {
+        fn pre_commit(
+            &self,
+            _slot: Slot,
+            results: &[solana_svm::transaction_processing_result::TransactionProcessingResult],
+        ) -> solana_transaction_error::TransactionResult<()> {
+            assert_eq!(results.len(), 1);
+            self.events.lock().unwrap().push("pre");
+            if self.reject_pre_commit {
+                // AccountInUse is an impossible scheduler-conflict error and
+                // deliberately panics in abort_or_accumulate_result. Exercise
+                // a permissible observer failure instead.
+                Err(TransactionError::InvalidAccountIndex)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn post_commit(
+            &self,
+            _slot: Slot,
+            results: &[solana_svm::transaction_commit_result::TransactionCommitResult],
+        ) {
+            assert_eq!(results.len(), 1);
+            self.events.lock().unwrap().push("post");
+        }
+    }
+
+    #[test]
+    fn test_scheduler_historical_observer_opt_in() {
+        let GenesisConfigInfo { genesis_config, mint_keypair, .. } = create_genesis_config(10_000);
+        for (enabled, reject) in [(false, false), (true, false), (true, true)] {
+            let bank = Bank::new_for_tests(&genesis_config);
+            let (bank, _forks) = setup_dummy_fork_graph(bank);
+            let mut pool = DefaultSchedulerPool::new(None, None, None, None, None, None);
+            let observer = Arc::new(HistoricalTestObserver {
+                reject_pre_commit: reject,
+                ..Default::default()
+            });
+            if enabled {
+                DefaultSchedulerPool::set_historical_observer(&mut pool, observer.clone()).unwrap();
+            }
+            let tx = ReplayTransaction::from(system_transaction::transfer(
+                &mint_keypair,
+                &solana_pubkey::new_rand(),
+                2,
+                genesis_config.hash(),
+            ));
+            let scheduler = pool.take_scheduler(SchedulingContext::new(bank.clone())).unwrap();
+            scheduler.schedule_execution(tx, 0).unwrap();
+            let bank_with_scheduler = BankWithScheduler::new(bank.clone(), Some(scheduler));
+            let result = bank_with_scheduler.wait_for_completed_scheduler().unwrap().0;
+            assert_eq!(result.is_err(), reject);
+            assert_eq!(bank.transaction_count(), if reject { 0 } else { 1 });
+            assert_eq!(
+                *observer.events.lock().unwrap(),
+                if !enabled { vec![] } else if reject { vec!["pre"] } else { vec!["pre", "post"] }
+            );
+        }
     }
 
     #[test]

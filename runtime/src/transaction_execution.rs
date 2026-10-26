@@ -16,12 +16,13 @@ use {
         transaction_cost::{TrackedCost, TransactionCost},
     },
     solana_measure::measure::Measure,
-    solana_runtime_transaction::transaction_with_meta::{TransactionWithMeta, writable_accounts},
+    solana_runtime_transaction::transaction_with_meta::{writable_accounts, TransactionWithMeta},
     solana_signature::Signature,
     solana_svm::{
         transaction_commit_result::{
             TransactionCommitResult, TransactionCommitResultExtensions as _,
         },
+        transaction_processing_result::{ProcessedTransaction, TransactionProcessingResult},
         transaction_processor::ExecutionRecordingConfig,
     },
     solana_svm_timings::{ExecuteTimingType, ExecuteTimings},
@@ -32,6 +33,82 @@ use {
     std::{borrow::Cow, sync::Arc, time::Instant},
     thiserror::Error,
 };
+
+/// Diagnostic capture phases. Neither phase by itself establishes historical
+/// ledger authority, program ELF identity, or a complete CPI trace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoricalCapturePhase {
+    PreCommit,
+    PostCommit,
+}
+
+/// A deliberately opt-in, synchronous observer of the actual execution path.
+/// The callback must not retain borrowed processing results or alter Bank state.
+/// A failed callback aborts the batch before commit; post-commit observation
+/// cannot roll back an already committed batch.
+pub trait HistoricalExecutionObserver {
+    fn pre_commit(
+        &self,
+        slot: Slot,
+        results: &[TransactionProcessingResult],
+    ) -> TransactionResult<()>;
+    fn post_commit(&self, slot: Slot, results: &[TransactionCommitResult]);
+
+    /// Bank state is exposed only after the commit call returns. The observer
+    /// must still establish transaction ordering and account-version identity
+    /// before treating any read as a transaction-specific post-image.
+    fn post_commit_bank_state(
+        &self,
+        _bank: &Bank,
+        _transactions: &[SanitizedTransaction],
+        _results: &[TransactionCommitResult],
+    ) {
+    }
+}
+
+/// Classification deliberately separates execution failure from fee-only and
+/// non-processed transactions; an instruction post-image is never a commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoricalExecutionKind {
+    ExecutedSuccess,
+    ExecutedFailure,
+    FeesOnly,
+    NoOp,
+    NotProcessed,
+}
+
+/// Evidence eligibility is independent of a successful replay or observer.
+/// Missing any authority component is a hard block, not a partial confirmation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HistoricalEvidenceCompleteness {
+    pub ledger_verified: bool,
+    pub bank_state_verified: bool,
+    pub final_accounts_recorded: bool,
+    pub trace_complete: bool,
+    pub program_identity_verified: bool,
+}
+
+impl HistoricalEvidenceCompleteness {
+    pub fn eligible_for_vi1(self) -> bool {
+        self.ledger_verified
+            && self.bank_state_verified
+            && self.final_accounts_recorded
+            && self.trace_complete
+            && self.program_identity_verified
+    }
+}
+
+pub fn classify_processing_result(result: &TransactionProcessingResult) -> HistoricalExecutionKind {
+    match result {
+        Ok(ProcessedTransaction::Executed(tx)) if tx.was_successful() => {
+            HistoricalExecutionKind::ExecutedSuccess
+        }
+        Ok(ProcessedTransaction::Executed(_)) => HistoricalExecutionKind::ExecutedFailure,
+        Ok(ProcessedTransaction::FeesOnly(_)) => HistoricalExecutionKind::FeesOnly,
+        Ok(ProcessedTransaction::NoOp(_)) => HistoricalExecutionKind::NoOp,
+        Err(_) => HistoricalExecutionKind::NotProcessed,
+    }
+}
 
 type WorkSequence = u64;
 
@@ -110,6 +187,33 @@ pub fn execute_batch<'a>(
     log_messages_bytes_limit: Option<usize>,
     prioritization_fee_cache: Option<&'a PrioritizationFeeCache>,
 ) -> TransactionResult<Vec<TransactionCost>> {
+    execute_batch_with_historical_observer(
+        batch,
+        bank,
+        transaction_status_sender,
+        replay_vote_sender,
+        replay_vote_send_type,
+        timings,
+        log_messages_bytes_limit,
+        prioritization_fee_cache,
+        None,
+    )
+}
+
+/// Optional capture path. Default execute_batch has no observer and preserves
+/// the existing recording and replay behavior.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_batch_with_historical_observer<'a>(
+    batch: &'a TransactionBatchWithIndexes<impl TransactionWithMeta>,
+    bank: &'a Arc<Bank>,
+    transaction_status_sender: Option<&'a TransactionStatusSender>,
+    replay_vote_sender: Option<&'a ReplayVoteSender>,
+    replay_vote_send_type: ReplayVoteSendType,
+    timings: &'a mut ExecuteTimings,
+    log_messages_bytes_limit: Option<usize>,
+    prioritization_fee_cache: Option<&'a PrioritizationFeeCache>,
+    observer: Option<&(dyn HistoricalExecutionObserver + Send + Sync)>,
+) -> TransactionResult<Vec<TransactionCost>> {
     let TransactionBatchWithIndexes {
         batch,
         transaction_indexes,
@@ -119,6 +223,11 @@ pub fn execute_batch<'a>(
 
     let pre_commit_callback = |processing_results: &_| -> TransactionResult<()> {
         // We're entering into one of the block-verification methods.
+        // Capture failed executions as well; a verification error must not
+        // silently suppress the pre-commit evidence for the rejected batch.
+        if let Some(observer) = observer {
+            observer.pre_commit(bank.slot(), processing_results)?;
+        }
         get_first_error(batch, processing_results)
     };
 
@@ -126,11 +235,25 @@ pub fn execute_batch<'a>(
         .bank()
         .load_execute_and_commit_transactions_with_pre_commit_callback(
             batch,
-            ExecutionRecordingConfig::new_single_setting(transaction_status_sender.is_some()),
+            ExecutionRecordingConfig::new_single_setting(
+                transaction_status_sender.is_some() || observer.is_some(),
+            ),
             timings,
             log_messages_bytes_limit,
             pre_commit_callback,
         )?;
+
+    if let Some(observer) = observer {
+        observer.post_commit(bank.slot(), &commit_results);
+        // This is an observation of the post-commit Bank, not a certified
+        // per-instruction or per-transaction account snapshot.
+        let sanitized: Vec<SanitizedTransaction> = batch
+            .sanitized_transactions()
+            .iter()
+            .map(|tx| tx.as_sanitized_transaction().into_owned())
+            .collect();
+        observer.post_commit_bank_state(bank, &sanitized, &commit_results);
+    }
 
     let mut check_block_costs_elapsed = Measure::start("check_block_costs");
 
@@ -350,7 +473,7 @@ mod tests {
         super::*,
         crate::{
             genesis_utils::{
-                GenesisConfigInfo, create_genesis_config, create_genesis_config_with_leader,
+                create_genesis_config, create_genesis_config_with_leader, GenesisConfigInfo,
             },
             transaction_batch::OwnedOrBorrowed,
         },
@@ -632,6 +755,53 @@ mod tests {
         assert_eq!(
             commit_results,
             vec![Err(TransactionError::AlreadyProcessed)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod historical_capture_tests {
+    use super::*;
+    use solana_transaction_error::TransactionError;
+
+    #[test]
+    fn unprocessed_transaction_is_not_a_successful_execution() {
+        let result: TransactionProcessingResult = Err(TransactionError::AccountNotFound);
+        assert_eq!(
+            classify_processing_result(&result),
+            HistoricalExecutionKind::NotProcessed
+        );
+    }
+
+    #[test]
+    fn incomplete_capture_never_qualifies_for_vi1() {
+        let complete = HistoricalEvidenceCompleteness {
+            ledger_verified: true,
+            bank_state_verified: true,
+            final_accounts_recorded: true,
+            trace_complete: true,
+            program_identity_verified: true,
+        };
+        assert!(complete.eligible_for_vi1());
+        assert!(!HistoricalEvidenceCompleteness::default().eligible_for_vi1());
+        for missing in 0..5 {
+            let mut candidate = complete;
+            match missing {
+                0 => candidate.ledger_verified = false,
+                1 => candidate.bank_state_verified = false,
+                2 => candidate.final_accounts_recorded = false,
+                3 => candidate.trace_complete = false,
+                _ => candidate.program_identity_verified = false,
+            }
+            assert!(!candidate.eligible_for_vi1());
+        }
+    }
+
+    #[test]
+    fn capture_phases_are_distinct() {
+        assert_ne!(
+            HistoricalCapturePhase::PreCommit,
+            HistoricalCapturePhase::PostCommit
         );
     }
 }
